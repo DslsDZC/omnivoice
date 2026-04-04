@@ -846,9 +846,7 @@ class ConferenceMode(BaseMode):
     
     async def _agenda_vote_and_review(self, agents, question: str, current_agenda: Dict):
         """议程投票环节 - 只投票，最后一议程才复盘"""
-        print("\n" + "="*50)
         print("[议程投票环节] 提取方案并投票排序")
-        print("="*50)
         
         try:
             # 检查是否是最后一个议程（使用白板的is_last判断）
@@ -899,9 +897,7 @@ class ConferenceMode(BaseMode):
             
             # 5. 只有最后一个议程才复盘
             if is_last_agenda:
-                print("\n" + "="*50)
                 print("[最终复盘] 所有议程已完成，进行最终复盘")
-                print("="*50)
                 
                 has_debate = await self._review_debate(agents, ranked_proposals, question)
                 
