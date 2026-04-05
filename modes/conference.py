@@ -1034,6 +1034,7 @@ class ConferenceMode(BaseMode):
         
         async def agent_think_loop(agent: Agent):
             """单个代理的持续思考循环"""
+            import re as re_module  # 显式导入避免作用域问题
             nonlocal total_speaks
             while not self._should_stop:
                 # 检查该代理是否已发送终止符号
@@ -1157,7 +1158,7 @@ class ConferenceMode(BaseMode):
                                     self._interrupt_wait_queue.remove(wait_item)
                         
                         # 检测叫停信号 [INTERRUPT]
-                        interrupt_match = re.search(r'\[INTERRUPT(?::@(\w+))?\]', result, re.IGNORECASE)
+                        interrupt_match = re_module.search(r'\[INTERRUPT(?::@(\w+))?\]', result, re_module.IGNORECASE)
                         if interrupt_match:
                             target_agent = interrupt_match.group(1)  # None 表示全体叫停
                             if target_agent:
@@ -1194,7 +1195,7 @@ class ConferenceMode(BaseMode):
                                     return
                         
                         # 检测投票信号
-                        vote_match = re.search(r'\[VOTE:\s*(.+?)\]', result)
+                        vote_match = re_module.search(r'\[VOTE:\s*(.+?)\]', result)
                         if vote_match:
                             proposal = vote_match.group(1).strip()
                             async with self._vote_lock:
@@ -1203,9 +1204,12 @@ class ConferenceMode(BaseMode):
                                     await self._run_vote(agents, question, proposal, agent.id)
                         
                         # 检测议程结束信号 [AGENDA_END]
-                        agenda_end_match = re.search(r'\[AGENDA_END\]', result)
+                        agenda_end_match = re_module.search(r'\[AGENDA_END\]', result)
                         if agenda_end_match and current_agenda:
                             self._ended_agents.add(agent.id)  # 该代理不再发言
+                            # 同时计入结束意向
+                            if agent.id not in self._end_votes:
+                                self._end_votes.add(agent.id)
                             # 记录议程结束投票
                             vote_result = self.whiteboard.vote_end_current_agenda(
                                 agent.id, True, "认为当前议程讨论充分"
@@ -1213,6 +1217,7 @@ class ConferenceMode(BaseMode):
                             if vote_result["success"]:
                                 print(f"\n[议程结束投票] {agent.id} 同意结束当前议程")
                                 print(f"  支持: {vote_result['agree_count']}/{vote_result['total_agents']}")
+                                print(f"  结束意向: {len(self._end_votes)}/{len(agents)}")
                                 
                                 # 检查是否达到多数
                                 if vote_result["should_end"]:
@@ -1892,6 +1897,7 @@ class ConferenceMode(BaseMode):
     
     async def _agent_speak(self, agent: Agent, question: str, round_num: int, user_message: str = None, current_agenda: Dict = None) -> Optional[str]:
         """代理发言 - 支持用户插话和议程上下文"""
+        import re  # 在函数开头导入
         state = self._agent_states[agent.id]
         
         # 根据强度调整提示词
@@ -2048,23 +2054,34 @@ class ConferenceMode(BaseMode):
             
             msg_type = "interrupt" if "[INTERRUPT]" in response.content else "normal"
             
-            # 提取立场和发言内容
-            import re
-            stance_match = re.search(r'\[立场[：:]\s*([^\]]+)\]', response.content)
+            # 提取立场和发言内容 - 兼容多种格式，冒号可选
+            # 格式: [立场：支持] 或 【立场】支持 或 [立场]支持 或 【立场：支持】
+            stance_match = re.search(r'[\[【]立场[：:]?\s*([^\]】\n]+)', response.content)
             stance = stance_match.group(1).strip() if stance_match else "中立"
+            # 清理立场中的多余字符
+            stance = re.sub(r'[\]：:]', '', stance).strip()
             
-            # 提取【给人看】部分
-            speech_match = re.search(r'【给人看】([^\n【]+)', response.content)
-            if speech_match:
-                display_content = speech_match.group(1).strip()
+            # 提取所有标签内容并组合显示
+            display_parts = []
+            for tag in ['给人看', '核心观点', '建议', '分析过程']:
+                match = re.search(rf'[【\[]{tag}[\]：:]*\s*([^\n【\[]+)', response.content)
+                if match:
+                    content = match.group(1).strip()
+                    if content:
+                        display_parts.append(content)
+            
+            # 组合所有内容
+            if display_parts:
+                display_content = " | ".join(display_parts)
             else:
-                # 如果没有【给人看】标记，提取立场后的第一句话
-                display_content = re.sub(r'\[立场[：:][^\]]+\]\s*', '', response.content).strip()
+                # fallback：提取立场后的第一句话
+                display_content = re.sub(r'[\[【]立场[：:]?[^\]】\n]*[\]】]?\s*', '', response.content).strip()
+                display_content = re.sub(r'[【\[][^】\]]*[\]：:]*\s*', '', display_content).strip()
                 if '\n' in display_content:
                     display_content = display_content.split('\n')[0].strip()
             
-            # 截断显示
-            content_preview = display_content[:100] + "..." if len(display_content) > 100 else display_content
+            # 截断显示（稍微长一点）
+            content_preview = display_content[:150] + "..." if len(display_content) > 150 else display_content
             
             # 立场颜色标记
             stance_colors = {

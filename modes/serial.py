@@ -243,16 +243,17 @@ class EnhancedSerialMode(BaseMode):
             voters = [a for a in agents if a.id != proposer.id]
             
             async def vote(agent):
+                import re as re_module  # 显式导入避免作用域问题
                 vote_prompt = self.prompts.serial_vote.format(
                     step_description=step.description,
                     proposal=current_proposal
                 )
                 resp = await agent.call_api([{"role": "user", "content": vote_prompt}], temperature=0.5)
                 if resp.success and resp.content:
-                    # 提取投票结果
-                    vote_match = re.search(r'\[投票[：:]\s*([^\]]+)\]', resp.content)
-                    speech_match = re.search(r'【给人看】([^\n【]+)', resp.content)
-                    reason_match = re.search(r'【理由】([^\n【]+)', resp.content)
+                    # 提取投票结果 - 兼容多种格式，冒号可选
+                    vote_match = re_module.search(r'[\[【]投票[：:]?\s*([^\]】\n]+)[\]】]?', resp.content)
+                    speech_match = re_module.search(r'[【\[]给人看[\]：:]*\s*([^\n【\[]+)', resp.content)
+                    reason_match = re_module.search(r'[【\[]理由[\]：:]*\s*([^\n【\[]+)', resp.content)
                     
                     vote_result = vote_match.group(1).strip() if vote_match else "同意"
                     speech = speech_match.group(1).strip() if speech_match else ""

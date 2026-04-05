@@ -1983,7 +1983,7 @@ class Whiteboard:
                 "agree_count": agree_count,
                 "total_agents": total_agents,
                 "agree_ratio": agree_ratio,
-                "should_end": agree_ratio >= 0.5  # 多数同意则结束
+                "should_end": agree_ratio >= 0.5  # 50%同意则结束
             }
     
     def check_agenda_end_consensus(self) -> Tuple[bool, float]:
