@@ -119,6 +119,7 @@ class ConferenceConfig:
     discussion_timeout_sec: int = 300
     idle_timeout_sec: int = 10
     max_messages_per_agent: int = 8
+    extract_proposals_timeout_sec: int = 120  # 提取方案超时时间
     serial_execution_keywords: List[str] = field(default_factory=lambda: [
         "执行", "步骤", "完成", "实现", "创建", "生成", "运行", "计算", "编写"
     ])
@@ -473,42 +474,64 @@ DEFAULT_PROMPTS = {
 
 只输出JSON。""",
 
-    "conference_discussion": """你是会议参与者。
+    "conference_discussion": """你是会议参与者，具备专家级分析能力。
 
 身份：{identity}
 性格：{personality}
-讨论主题：{topic}
+主题：{topic}
 
 === 已有讨论 ===
 {discussion_history}
 
-轮次：{round}/{max_rounds}
+=== 高级分析框架 ===
 
-=== 发言规则 ===
-1. 阅读已有讨论，避免重复观点
-2. 可使用工具支持观点（如搜索、计算等）
-3. 保持你的性格一致性
+【第一阶段：苏格拉底式提问】
+在发言前，先问自己三个问题：
+1. 这个方案的核心假设是什么？假设是否合理？
+2. 如果这个方案是错的，最可能的原因是什么？
+3. 有什么反例或边界情况被忽略了？
 
-=== 重要：避免重复 ===
-- 如果你的观点与已有发言一致，直接输出：同意[某代理]的观点，[简短补充]
-- 不要重新阐述已说过的内容
-- 如果你认为讨论已充分，立即发起叫停或结束
+【第二阶段：辩证分析】
+正题：现有方案的优点是什么？
+反题：现有方案的问题/漏洞是什么？（必须找出至少一个）
+合题：如何改进或综合？
+
+【第三阶段：多维验证】
+根据问题类型，选择合适的验证维度：
+- 数值类：计算验证、单位换算、边界检查
+- 方案类：可行性、完整性、约束满足度
+- 创意类：创新性、实用性、可实现性
+- 决策类：利弊权衡、风险评估、替代方案
+
+【第四阶段：专业视角】
+自动识别问题领域，从专业角度审视：
+- 识别问题所属领域（如：规划/设计/分析/评估等）
+- 应用该领域的专业标准和方法论
+- 指出非专业人士容易忽略的问题
+
+=== 输出格式 ===
+[立场：支持/反对/质疑/补充/修正]
+【给人看】一句人类能懂的自然口语（像真人聊天）
+【核心观点】一句话概括你的贡献
+【分析过程】一句话说明问题识别和验证结果
+【建议】一句话改进方案（如有）
+
+=== 质量红线 ===
+⛔ 禁止空话："我支持"、"我同意"必须附带具体理由
+⛔ 禁止复制：不能复制粘贴已有内容
+⛔ 禁止跳过验证：涉及数据/事实必须验证
+⛔ 禁止过早结束：方案不完善时不能用[END]
 
 === 叫停机制 ===
-当你认为讨论充分、可以进入决策阶段时，可以发起叫停：
+[INTERRUPT] 全体叫停提议：你的提案
+[INTERRUPT:@{agent_id}] 指定叫停：针对某代理
+[AGENDA_END] 议程结束请求
 
-1. **全体叫停**：输出 [INTERRUPT] 我提议：[你的提案内容]
-   - 系统将发起叫停投票，需要至少5个代理参与
-   - 其中3个以上同意才能通过，进入最终表决
-   - 适用于：已达成基本共识、需要快速决策
-
-2. **指定叫停**：输出 [INTERRUPT:@{agent_id}] 我建议{agent_id}停止重复...
-   - 针对特定代理，要求其停止当前行为
-   - 该代理将等待其他人发言后获得优先思考权
-   - 适用于：某代理持续重复、跑题、无建设性发言
-
-3. **议程结束**：输出 [AGENDA_END] 我认为当前议程讨论充分
-   - 结束当前议程，进入下一个议程
+=== [END]触发条件 ===
+✓ 方案具体到可直接执行
+✓ 所有约束条件已验证满足
+✓ 至少有1次质疑和回应
+✓ 关键信息已核实正确
 
 请发表你的观点：""",
 
@@ -638,6 +661,54 @@ DEFAULT_PROMPTS = {
 
 请选择最佳方案，输出方案编号：""",
 
+    "serial_proposal": """请针对以下步骤提出解决方案：
+
+问题：{question}
+当前步骤：{step_description}
+期望输出：{expected_output}
+{context}
+
+请直接输出你的方案。""",
+
+    "serial_vote": """请对以下方案投票：
+
+【步骤】{step_description}
+【方案】{proposal}
+
+请投票：
+- 同意：方案正确可行
+- 反对：方案有问题需要修改
+
+输出格式：
+[投票：同意/反对]
+【给人看】一句话说明你的判断
+【理由】具体的分析（如有问题请指出）""",
+
+    "serial_revise": """请根据投票结果修改方案：
+
+【原方案】{proposal}
+【反对意见】{objections}
+【反对人数】{oppose_count}/{total_count}
+
+请修改方案，解决反对意见指出的问题。""",
+
+    "serial_feedback": """请审议以下方案：
+
+步骤：{step_description}
+方案：{proposal}
+{existing_proposals}
+
+如果有反对意见输出JSON：{{"agree": false, "objection": "问题所在"}}
+如果同意输出JSON：{{"agree": true, "reason": "同意理由"}}""",
+
+    "serial_temp_meeting": """步骤执行遇到问题，需要临时会议讨论。
+
+步骤：{step_description}
+当前方案：{proposal}
+问题：{issue}
+
+请各位代理讨论并给出建议。""",
+
     "end_check_prompt": """判断讨论是否应该结束。
 
 问题：{question}
@@ -650,16 +721,24 @@ DEFAULT_PROMPTS = {
 
 问题：{question}
 
-请分析这个问题，生成一份会议议程。议程应该：
+请分析这个问题，生成一份详细的会议议程。议程应该：
 1. 将问题分解为可讨论的子议题
-2. 每个议题应该明确、可讨论
-3. 议题之间有逻辑顺序
-4. 通常3-6个议题为宜
+2. 每个议题必须包含2-4个具体的子问题（sub_questions），这些子问题是讨论时需要回答的核心问题
+3. 子问题要具体、可执行、可讨论，避免抽象泛泛而谈
+4. 议题之间有逻辑顺序
+5. 通常3-5个议题为宜
 
 输出JSON数组格式：
 [
-  {{"title": "议题标题", "description": "议题详细描述"}},
-  {{"title": "议题标题2", "description": "议题详细描述2"}}
+  {{
+    "title": "议题标题",
+    "description": "议题详细描述",
+    "sub_questions": [
+      "具体子问题1：需要回答什么？",
+      "具体子问题2：需要验证什么？",
+      "具体子问题3：需要决策什么？"
+    ]
+  }}
 ]
 
 只输出JSON数组，不要其他内容。""",
@@ -698,12 +777,20 @@ DEFAULT_PROMPTS = {
 1. 整合各方合理的建议
 2. 解决讨论中提出的质疑
 3. 确保议程完整且有逻辑顺序
-4. 通常3-6个议题为宜
+4. 每个议题必须包含2-4个具体的子问题（sub_questions）
+5. 子问题要具体、可执行、可讨论
+6. 通常3-5个议题为宜
 
 输出JSON数组格式：
 [
-  {{"title": "议题标题", "description": "议题详细描述"}},
-  {{"title": "议题标题2", "description": "议题详细描述2"}}
+  {{
+    "title": "议题标题",
+    "description": "议题详细描述",
+    "sub_questions": [
+      "具体子问题1：需要回答什么？",
+      "具体子问题2：需要验证什么？"
+    ]
+  }}
 ]
 
 只输出JSON数组：""",
@@ -1027,6 +1114,11 @@ class PromptsConfig:
     serial_task_decomposition: str = DEFAULT_PROMPTS["serial_task_decomposition"]
     serial_step_speak: str = DEFAULT_PROMPTS["serial_step_speak"]
     serial_quick_decision: str = DEFAULT_PROMPTS["serial_quick_decision"]
+    serial_proposal: str = DEFAULT_PROMPTS["serial_proposal"]
+    serial_vote: str = DEFAULT_PROMPTS["serial_vote"]
+    serial_feedback: str = DEFAULT_PROMPTS["serial_feedback"]
+    serial_revise: str = DEFAULT_PROMPTS["serial_revise"]
+    serial_temp_meeting: str = DEFAULT_PROMPTS["serial_temp_meeting"]
     end_check_prompt: str = DEFAULT_PROMPTS["end_check_prompt"]
     agenda_generation: str = DEFAULT_PROMPTS["agenda_generation"]
     agenda_debate: str = DEFAULT_PROMPTS["agenda_debate"]
@@ -1353,6 +1445,7 @@ def load_config(config_path: str) -> SystemConfig:
         discussion_timeout_sec=conference_data.get('discussion_timeout_sec', 300),
         idle_timeout_sec=conference_data.get('idle_timeout_sec', 10),
         max_messages_per_agent=conference_data.get('max_messages_per_agent', 8),
+        extract_proposals_timeout_sec=conference_data.get('extract_proposals_timeout_sec', 120),
         serial_execution_keywords=conference_data.get('serial_execution_keywords', [
             "执行", "步骤", "完成", "实现", "创建", "生成", "运行", "计算", "编写"
         ]),
@@ -1431,6 +1524,11 @@ def load_config(config_path: str) -> SystemConfig:
         serial_task_decomposition=prompts_data.get('serial_task_decomposition', DEFAULT_PROMPTS["serial_task_decomposition"]),
         serial_step_speak=prompts_data.get('serial_step_speak', DEFAULT_PROMPTS["serial_step_speak"]),
         serial_quick_decision=prompts_data.get('serial_quick_decision', DEFAULT_PROMPTS["serial_quick_decision"]),
+        serial_proposal=prompts_data.get('serial_proposal', DEFAULT_PROMPTS["serial_proposal"]),
+        serial_vote=prompts_data.get('serial_vote', DEFAULT_PROMPTS["serial_vote"]),
+        serial_feedback=prompts_data.get('serial_feedback', DEFAULT_PROMPTS["serial_feedback"]),
+        serial_revise=prompts_data.get('serial_revise', DEFAULT_PROMPTS["serial_revise"]),
+        serial_temp_meeting=prompts_data.get('serial_temp_meeting', DEFAULT_PROMPTS["serial_temp_meeting"]),
         end_check_prompt=prompts_data.get('end_check_prompt', DEFAULT_PROMPTS["end_check_prompt"]),
         agenda_generation=prompts_data.get('agenda_generation', DEFAULT_PROMPTS["agenda_generation"]),
         agenda_debate=prompts_data.get('agenda_debate', DEFAULT_PROMPTS["agenda_debate"]),

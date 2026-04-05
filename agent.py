@@ -2,10 +2,12 @@
 import asyncio
 import json
 import time
+import ssl
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Callable
 import aiohttp
+import certifi
 
 from config_loader import AgentConfig, PersonalityConfig, StanceType
 from whiteboard import Whiteboard
@@ -284,7 +286,11 @@ class Agent:
             timeout_seconds = 300 if self._is_reasoning_model else 120
             timeout = aiohttp.ClientTimeout(total=timeout_seconds)
             
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            # 使用 certifi 的 SSL 证书
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
                 url = f"{self.api.base_url.rstrip('/')}/chat/completions"
                 async with session.post(url, headers=headers, json=payload) as resp:
                     if resp.status != 200:

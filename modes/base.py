@@ -1,5 +1,6 @@
 """模式基类"""
 import asyncio
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional
@@ -21,6 +22,11 @@ class ModeResult:
     tool_results: List[Dict] = field(default_factory=list)
     workspace_files: List[str] = field(default_factory=list)
     stats: Dict = field(default_factory=dict)
+    metrics: Dict = field(default_factory=dict)
+    intermediate_results: Dict = field(default_factory=dict)
+    proposals: List[Dict] = field(default_factory=list)
+    steps: List[str] = field(default_factory=list)
+    agenda_conclusions: List[Dict] = field(default_factory=list)
     error: Optional[str] = None
 
 
@@ -200,6 +206,3 @@ class BaseMode(ABC):
             workspace_files=workspace_files,
             stats=stats
         )
-
-
-import json

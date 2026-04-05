@@ -352,6 +352,20 @@ class Whiteboard:
             self._consensus.clear()
             self._version += 1
     
+    def clear_discussion_messages(self):
+        """清空讨论消息，保留系统消息（议程设置等）"""
+        with self._lock:
+            # 只保留系统消息和议程相关消息
+            self._messages = [
+                msg for msg in self._messages 
+                if msg.message_type in ("system", "agenda", "agenda_set", "main_topic")
+            ]
+            # 清除代理贡献记录
+            self._agent_contributions.clear()
+            # 清除待解决问题
+            self._pending_issues.clear()
+            self._version += 1
+    
     # ==================== 代理性格操作 ====================
     
     def set_agent_personalities(self, personalities: Dict[str, Dict]):

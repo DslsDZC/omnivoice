@@ -15,6 +15,16 @@ from oscillation_guard import (
 
 
 @dataclass
+class ComplexityAssessment:
+    """问题复杂度评估结果"""
+    is_simple_fact: bool  # 是否是简单事实
+    has_controversy: bool  # 是否有争议
+    complexity_score: float  # 复杂度分数 0-10
+    reason: str
+    direct_mode: Optional[str] = None  # 如果确定，直接返回模式
+
+
+@dataclass
 class VotingResult:
     """投票结果"""
     agent_id: str
@@ -42,6 +52,114 @@ class ModeDecisionMaker:
         self.config = config
         self.prompts = prompts or PromptsConfig()
     
+    async def _assess_question_complexity(self, agents: List[Agent], 
+                                           question: str) -> ComplexityAssessment:
+        """评估问题特征 - 决定模式"""
+        print(f"\n[问题特征分析] 分析问题性质...")
+        
+        import re
+        question_lower = question.lower()
+        
+        # ========== 第一层：用户明确意图检测 ==========
+        
+        # 用户要求直接回答的关键词
+        direct_answer_keywords = [
+            "直接回答", "直接告诉我", "直接说", "简单说", 
+            "只说答案", "不要讨论", "快速回答", "简短回答",
+            "一句话", "直接给答案", "不用讨论"
+        ]
+        
+        # 用户要求讨论/分析/评估的关键词
+        discussion_keywords = [
+            "讨论", "分析", "评估", "辩论", "多角度",
+            "从不同角度", "各方观点", "深入分析", "详细分析",
+            "大家讨论", "一起讨论", "分析一下", "评估一下"
+        ]
+        
+        # 检测用户明确要求直接回答
+        for kw in direct_answer_keywords:
+            if kw in question_lower:
+                print(f"  [用户意图] 检测到「{kw}」→ 串行模式")
+                return ComplexityAssessment(
+                    is_simple_fact=True,
+                    has_controversy=False,
+                    complexity_score=2.0,
+                    reason="用户明确要求直接回答",
+                    direct_mode="serial"
+                )
+        
+        # 检测用户明确要求讨论分析
+        for kw in discussion_keywords:
+            if kw in question_lower:
+                print(f"  [用户意图] 检测到「{kw}」→ 会议模式")
+                return ComplexityAssessment(
+                    is_simple_fact=False,
+                    has_controversy=True,
+                    complexity_score=8.0,
+                    reason="用户明确要求讨论分析",
+                    direct_mode="conference"
+                )
+        
+        # ========== 第二层：事实性 vs 开放性判断 ==========
+        
+        # 明显的事实性问题模式（答案唯一）
+        fact_patterns = [
+            r'^\s*\d+\s*[\+\-\*\/\^]\s*\d+\s*=\s*\?*\s*$',  # 算术
+            r'^\s*\d+\s*[\+\-\*\/\^]\s*\d+',  # 计算表达式
+            r'今天.*星期',  # 日期
+            r'现在.*时间',  # 时间
+            r'^计算\s+',  # 计算
+            r'等于多少',  # 等于多少
+            r'是多少\?*$',  # 是多少
+            r'什么定义',  # 定义
+            r'什么意思',  # 含义
+            r'是谁\?*$',  # 人物
+            r'在哪里\?*$',  # 地点
+            r'什么时候\?*$',  # 时间点
+        ]
+        
+        for pattern in fact_patterns:
+            if re.search(pattern, question, re.IGNORECASE):
+                print(f"  [问题类型] 事实性问题（答案唯一）→ 串行模式")
+                return ComplexityAssessment(
+                    is_simple_fact=True,
+                    has_controversy=False,
+                    complexity_score=2.0,
+                    reason="事实性问题，答案唯一无争议",
+                    direct_mode="serial"
+                )
+        
+        # 开放性问题关键词（需要权衡）
+        open_ended_keywords = [
+            "应该", "是否", "好不好", "对不对", "值得", "利弊",
+            "看法", "观点", "选择", "比较", "哪个好", "更好",
+            "优缺点", "有人认为", "有人说", "一部分人", "不同意见",
+            "建议", "推荐", "如何选择", "怎么办", "怎样处理",
+            "评价", "怎么看", "分析下", "权衡"
+        ]
+        
+        # 检测开放性问题
+        open_keywords_found = [kw for kw in open_ended_keywords if kw in question_lower]
+        if open_keywords_found:
+            print(f"  [问题类型] 开放性问题（需权衡：{open_keywords_found[0]}）→ 会议模式")
+            return ComplexityAssessment(
+                is_simple_fact=False,
+                has_controversy=True,
+                complexity_score=7.0,
+                reason=f"开放性问题，需要权衡多种可能",
+                direct_mode="conference"
+            )
+        
+        # ========== 无法判断，进入投票 ==========
+        print(f"  [问题类型] 无法快速判断 → 进入投票决策")
+        return ComplexityAssessment(
+            is_simple_fact=False,
+            has_controversy=False,
+            complexity_score=5.0,
+            reason="问题性质不明确，需投票决定",
+            direct_mode=None  # None表示需要投票
+        )
+    
     async def vote(self, agents: List[Agent], question: str,
                    whiteboard: Optional[Whiteboard] = None,
                    timeout: float = 60.0) -> ModeDecision:
@@ -49,9 +167,29 @@ class ModeDecisionMaker:
         # 选择投票代理（优先标准模型）
         voting_agents = self._select_voting_agents(agents)
         
-        print(f"[模式决策投票] 开始")
-        print(f"  参与投票代理: {len(voting_agents)} 个")
+        print(f"[模式决策] 开始")
         print(f"  问题: {question[:60]}...")
+        
+        # 第一步：评估问题复杂度
+        assessment = await self._assess_question_complexity(voting_agents, question)
+        
+        # 如果问题性质明确，直接返回
+        if assessment.direct_mode:
+            mode_names = {"conference": "会议", "serial": "串行"}
+            selected_name = mode_names.get(assessment.direct_mode, assessment.direct_mode)
+            print(f"\n[直接决策] {selected_name}模式")
+            print(f"  理由: {assessment.reason}")
+            
+            return ModeDecision(
+                selected_mode=assessment.direct_mode,
+                votes=[],
+                vote_counts={"conference": 0, "serial": 1 if assessment.direct_mode == "serial" else 0},
+                tie_breaker_used=False,
+                final_reason=assessment.reason
+            )
+        
+        # 第二步：复杂度不明确，进行投票
+        print(f"\n[投票决策] 参与投票代理: {len(voting_agents)} 个")
         
         # 并行调用API
         print("\n[投票进行中...]")
@@ -179,11 +317,18 @@ class ModeDecisionMaker:
         """获取单个代理的投票"""
         prompt = self.prompts.mode_voting.format(question=question)
         
+        # 根据代理性格调整温度，增加投票多样性
+        # 独立性高的代理用更高温度，更可能有不同观点
+        base_temp = 0.3
+        independence = agent.personality.independence if hasattr(agent, 'personality') else 5
+        temperature = base_temp + (independence - 5) * 0.05  # 范围 0.05-0.55
+        temperature = max(0.1, min(0.7, temperature))
+        
         messages = [{"role": "user", "content": prompt}]
         
         try:
             response = await asyncio.wait_for(
-                agent.call_api(messages, temperature=0.3),
+                agent.call_api(messages, temperature=temperature),
                 timeout=timeout
             )
             
