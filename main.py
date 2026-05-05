@@ -7,6 +7,41 @@ import time
 from pathlib import Path
 from typing import Optional, Dict
 
+# ============================================================
+# Termux Python 3.13 兼容性修补
+# Termux Python 3.13 的 importlib 模块没有导出 import_module
+# 这会导致 certifi 等库调用 importlib.import_module 时失败
+# 必须在导入任何其他模块之前执行此修补
+# ============================================================
+import importlib
+import importlib.util
+import importlib._bootstrap
+
+if not hasattr(importlib, 'import_module'):
+    # 使用 importlib._bootstrap 中的底层实现
+    # 这是 Python 标准库实际使用的实现
+    def _import_module(name, package=None):
+        """兼容性 import_module 实现，使用底层 _bootstrap 函数"""
+        level = 0
+        if name.startswith('.'):
+            if not package:
+                raise ImportError("the 'package' argument is required for relative imports")
+            for character in name:
+                if character != '.':
+                    break
+                level += 1
+            name = name[level:]
+        else:
+            level = 0
+        
+        # 使用 _bootstrap 的底层函数
+        return importlib._bootstrap._gcd_import(name, level)
+    
+    # 在模块级别添加函数
+    importlib.import_module = _import_module
+    # 确保在 sys.modules 中的 importlib 也有这个函数
+    sys.modules['importlib'].import_module = _import_module
+
 # 添加当前目录到路径
 sys.path.insert(0, str(Path(__file__).parent))
 

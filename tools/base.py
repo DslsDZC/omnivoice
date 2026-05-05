@@ -218,13 +218,22 @@ class PluginLoader:
     def load_plugin(self, plugin_path: str, config: Dict = None) -> Optional[BasePlugin]:
         """加载单个插件"""
         try:
-            # 动态导入模块
-            spec = importlib.util.spec_from_file_location("plugin_module", plugin_path)
-            if not spec or not spec.loader:
-                return None
+            # 使用 runpy 作为替代方案（兼容 Python 3.13）
+            import runpy
+            import sys
             
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            # 生成唯一的模块名
+            module_name = f"plugin_{hashlib.md5(plugin_path.encode()).hexdigest()[:8]}"
+            
+            # 使用 runpy 执行模块
+            module_dict = runpy.run_path(plugin_path, run_name=module_name)
+            
+            # 创建一个简单的模块对象
+            class SimpleModule:
+                pass
+            module = SimpleModule()
+            for key, value in module_dict.items():
+                setattr(module, key, value)
             
             # 查找插件类
             plugin_class = None

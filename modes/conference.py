@@ -255,9 +255,8 @@ class ConferenceMode(BaseMode):
             if not self.whiteboard.get_final_resolution():
                 await self._force_resolution(question)
             
-            # 检测是否需要串行执行
-            if self._should_continue_serial and self._extracted_steps:
-                await self._auto_serial_phase(question)
+            # 直接进入串行总结模式（不需要判断）
+            await self._serial_summary_phase(question)
             
             # 保存会话数据到文件
             self._save_session_data(question)
@@ -1210,9 +1209,10 @@ class ConferenceMode(BaseMode):
                             # 同时计入结束意向
                             if agent.id not in self._end_votes:
                                 self._end_votes.add(agent.id)
-                            # 记录议程结束投票
+                            # 记录议程结束投票（传入总代理数）
                             vote_result = self.whiteboard.vote_end_current_agenda(
-                                agent.id, True, "认为当前议程讨论充分"
+                                agent.id, True, "认为当前议程讨论充分",
+                                total_enabled_agents=len(agents)  # 传入启动的总代理数
                             )
                             if vote_result["success"]:
                                 print(f"\n[议程结束投票] {agent.id} 同意结束当前议程")
@@ -1383,26 +1383,16 @@ class ConferenceMode(BaseMode):
                 self.whiteboard.advance_agenda()
                 print(f"\n[议程推进] 进入下一个议程")
             
-            # 5. 只有最后一个议程才复盘
+            # 5. 只有最后一个议程才复盘，然后进入串行模式总结
             if is_last_agenda:
-                print("[最终复盘] 所有议程已完成，进行最终复盘")
+                print("[最终复盘] 所有议程已完成，进行复盘讨论...")
                 
-                has_debate = await self._review_debate(agents, ranked_proposals, question)
+                # 复盘：多代理讨论细化方案
+                await self._review_debate(agents, ranked_proposals, question)
                 
-                if has_debate:
-                    # 有争论，继续讨论
-                    print("\n[复盘] 存在分歧，继续讨论...")
-                    self._should_stop = False
-                    self._end_votes = set()
-                    self._ended_agents = set()  # 重置已结束代理列表，允许重新发言
-                    # 获取下一个议程继续讨论
-                    next_agenda = self.whiteboard.get_current_agenda_item()
-                    if next_agenda:
-                        await self._discussion_loop(question, next_agenda)
-                else:
-                    # 无争论，串行输出结论
-                    print("\n[复盘] 达成共识，生成最终结论")
-                    await self._generate_final_conclusion(agents, question, current_agenda, ranked_proposals)
+                # 无论是否有分歧，都进入串行模式总结
+                print("\n[串行模式] 进入串行模式生成最终总结...")
+                await self._generate_final_conclusion(agents, question, current_agenda, ranked_proposals)
                     
         except Exception as e:
             print(f"  [议程投票错误] {e}")
@@ -1531,41 +1521,168 @@ class ConferenceMode(BaseMode):
                        key=lambda x: x[1], reverse=True)
         return ranked
     
-    async def _review_debate(self, agents, ranked_proposals: List[tuple], question: str) -> bool:
-        """复盘讨论，返回是否有争论"""
+    async def _review_debate(self, agents, ranked_proposals: List[tuple], question: str):
+        """复盘讨论 - 多代理共同细化方案，结果存储到白板供串行模式使用"""
         proposals_text = "\n".join([f"第{i+1}名: {p[0]} (得分{p[1]})" 
                                    for i, p in enumerate(ranked_proposals)])
         
-        # 快速询问是否有分歧
-        agree_count = 0
-        disagree_count = 0
+        print("\n[复盘讨论] 多代理共同细化方案...")
         
-        for agent in agents[:min(5, len(agents))]:  # 最多问5个代理
-            prompt = self.prompts.review_debate.format(question=question, proposals_text=proposals_text)
-
-            try:
-                response = await agent.call_api(
-                    [{"role": "user", "content": prompt}],
-                    tools=None,
-                    temperature=0.3
-                )
+        # 收集所有讨论内容
+        all_discussions = []
+        
+        # 第1轮：每个代理发表细化意见（并行）
+        round1_tasks = []
+        for agent in agents[:min(5, len(agents))]:
+            personality = agent.get_personality_prompt()
+            stance = getattr(self._agent_states.get(agent.id, {}), 'stance_instruction', '中立')
+            
+            prompt = self.prompts.review_debate.format(
+                question=question,
+                proposals_text=proposals_text,
+                personality=personality,
+                stance=stance
+            )
+            round1_tasks.append(self._agent_review_speak(agent, prompt))
+        
+        # 并行执行
+        round1_results = await asyncio.gather(*round1_tasks, return_exceptions=True)
+        
+        for result in round1_results:
+            if result and not isinstance(result, Exception):
+                agent_id, content = result
+                if content:
+                    all_discussions.append(f"[{agent_id}]: {content}")
+                    print(f"  [{agent_id}]: {content[:80]}...")
+        
+        # 检查是否有明显分歧，有则继续第2轮
+        has_debate = self._check_review_debate(all_discussions)
+        
+        if has_debate:
+            # 第2轮：继续讨论，回应他人观点
+            print("\n[复盘第2轮] 继续细化讨论...")
+            
+            previous_discussion = "\n".join(all_discussions[-10:])
+            
+            round2_tasks = []
+            for agent in agents[:min(5, len(agents))]:
+                personality = agent.get_personality_prompt()
                 
-                if response.success and response.content:
-                    if "同意" in response.content and "需要讨论" not in response.content:
-                        agree_count += 1
-                        print(f"  [{agent.id}] 同意排序结果")
-                    else:
-                        disagree_count += 1
-                        print(f"  [{agent.id}] 需要讨论: {response.content[:50]}...")
-            except Exception as e:
-                pass
+                prompt = self.prompts.review_round.format(
+                    round=2,
+                    question=question,
+                    proposals_text=proposals_text,
+                    previous_discussion=previous_discussion,
+                    personality=personality
+                )
+                round2_tasks.append(self._agent_review_speak(agent, prompt))
+            
+            round2_results = await asyncio.gather(*round2_tasks, return_exceptions=True)
+            
+            for result in round2_results:
+                if result and not isinstance(result, Exception):
+                    agent_id, content = result
+                    if content:
+                        all_discussions.append(f"[{agent_id}]: {content}")
+                        print(f"  [{agent_id}]: {content[:80]}...")
         
-        # 如果超过1/3的人需要讨论，则有争论
-        return disagree_count > agree_count // 2
+        # 综合各方意见
+        print("\n[复盘综合] 生成细化后的方案...")
+        synthesizer = agents[0]
+        discussion = "\n".join(all_discussions)
+        
+        synthesize_prompt = self.prompts.review_synthesize.format(
+            question=question,
+            discussion=discussion,
+            proposals_text=proposals_text
+        )
+        
+        # 存储复盘讨论内容到白板
+        self.whiteboard.add_review_record(
+            content=discussion,
+            review_type="discussion"
+        )
+        
+        try:
+            response = await synthesizer.call_api(
+                [{"role": "user", "content": synthesize_prompt}],
+                tools=None,
+                temperature=0.3
+            )
+            
+            if response.success and response.content:
+                # 尝试解析JSON
+                import json
+                import re
+                content = response.content
+                match = re.search(r'\{.*\}', content, re.DOTALL)
+                if match:
+                    try:
+                        result = json.loads(match.group())
+                        directions = result.get("directions", [])
+                        details = result.get("details", "")
+                        next_actions = result.get("next_actions", [])
+                        
+                        print("\n【复盘结果】")
+                        if directions:
+                            print("方案方向：")
+                            for i, d in enumerate(directions, 1):
+                                print(f"  {i}. {d}")
+                        if details:
+                            print(f"\n关键细节：{details[:200]}")
+                        if next_actions:
+                            print(f"\n后续事项：{', '.join(next_actions[:5])}")
+                        
+                        # 存储复盘综合结果到白板，供串行模式使用
+                        self.whiteboard.add_review_record(
+                            content=json.dumps({
+                                "directions": directions,
+                                "details": details,
+                                "next_actions": next_actions
+                            }, ensure_ascii=False),
+                            review_type="synthesis"
+                        )
+                    except json.JSONDecodeError:
+                        print(f"\n{content[:300]}")
+                        self.whiteboard.add_review_record(
+                            content=content[:500],
+                            review_type="synthesis"
+                        )
+        except Exception as e:
+            print(f"  综合失败: {e}")
+    
+    async def _agent_review_speak(self, agent, prompt: str) -> tuple:
+        """单个代理发表复盘意见"""
+        try:
+            response = await agent.call_api(
+                [{"role": "user", "content": prompt}],
+                tools=None,
+                temperature=0.5
+            )
+            if response.success and response.content:
+                return (agent.id, response.content)
+        except:
+            pass
+        return (agent.id, "")
+    
+    def _check_review_debate(self, discussions: List[str]) -> bool:
+        """检查复盘讨论是否有分歧"""
+        # 简单检测：是否有反对意见或不同观点
+        debate_keywords = ["但是", "不过", "问题", "风险", "反对", "质疑", "建议", "修改", "整合"]
+        debate_count = 0
+        
+        for d in discussions:
+            for kw in debate_keywords:
+                if kw in d:
+                    debate_count += 1
+                    break
+        
+        # 超过半数有细化建议则认为有讨论价值
+        return debate_count > len(discussions) // 2
     
     async def _generate_final_conclusion(self, agents, question: str, current_agenda: Dict, 
                                          ranked_proposals: List[tuple] = None):
-        """调用串行模式生成最终结论"""
+        """调用串行模式生成最终结论（基于复盘结果）"""
         messages = self.whiteboard.get_messages()
         discussion = "\n".join([f"{m.agent_id}: {m.content[:150]}" for m in messages[-30:]])
         
@@ -1589,9 +1706,19 @@ class ConferenceMode(BaseMode):
                         "conclusion": item['conclusion']
                     })
         
-        print("\n[串行模式] 调用串行模式生成最终结论...")
+        # 获取复盘结果
+        review_records = self.whiteboard.get_review_records()
+        review_synthesis = None
+        for record in review_records:
+            if record.get('type') == 'synthesis':
+                review_synthesis = record.get('content', '')
+                break
+        
+        print("\n[串行模式] 基于复盘结果生成最终总结...")
         print(f"  传递 {len(all_proposals)} 个提议")
         print(f"  传递 {len(agenda_conclusions)} 个议程结论")
+        if review_synthesis:
+            print(f"  传递复盘综合结果")
         
         try:
             # 创建串行模式实例
@@ -1603,12 +1730,13 @@ class ConferenceMode(BaseMode):
                 config=self.config
             )
             
-            # 执行结论生成任务，传递所有上下文
+            # 执行结论生成任务，传递所有上下文（包括复盘结果）
             result = await serial_mode.execute(
                 question=question,
                 proposals=all_proposals,
                 agenda_conclusions=agenda_conclusions,
-                discussion=discussion[:2000]
+                discussion=discussion[:2000],
+                review_synthesis=review_synthesis  # 新增：传递复盘结果
             )
             
             if result and result.success and result.final_resolution:
@@ -1906,6 +2034,9 @@ class ConferenceMode(BaseMode):
         # 获取讨论历史
         discussion_history = self._get_recent_messages(10)
         
+        # 获取该代理之前的发言，避免重复
+        agent_previous_speeches = self._get_agent_previous_speeches(agent.id)
+        
         # 获取议程信息
         agenda_context = ""
         if current_agenda:
@@ -1954,10 +2085,19 @@ class ConferenceMode(BaseMode):
             discussion_history=discussion_history if discussion_history else "（暂无讨论）"
         )
         
-        # 加入代理专属立场提示词
+        # 加入代理专属立场提示词（强制！）
         stance_instruction = getattr(state, 'stance_instruction', None) or getattr(agent, 'custom_stance', None)
         if stance_instruction:
-            prompt = f"[专属立场] {stance_instruction}\n\n{prompt}"
+            prompt = f"""【强制立场】你必须以"{stance_instruction}"的立场发言！
+- 你的每句话都要体现这个立场
+- 如果发现你的发言与立场不符，必须重写
+- 立场是你的身份，不能违背
+
+{prompt}"""
+        
+        # 提醒代理之前说过什么，避免重复
+        if agent_previous_speeches:
+            prompt += f"\n\n=== 你之前的发言（禁止重复！） ===\n{agent_previous_speeches}\n⚠️ 你已经说过以上内容，请勿重复！若无新观点，请输出[AGENDA_END]结束议题。"
         
         # 加入长期记忆
         memory_prompt = self.whiteboard.get_long_term_memory_prompt()
@@ -2061,24 +2201,31 @@ class ConferenceMode(BaseMode):
             # 清理立场中的多余字符
             stance = re.sub(r'[\]：:]', '', stance).strip()
             
-            # 提取所有标签内容并组合显示
-            display_parts = []
-            for tag in ['给人看', '核心观点', '建议', '分析过程']:
-                match = re.search(rf'[【\[]{tag}[\]：:]*\s*([^\n【\[]+)', response.content)
-                if match:
-                    content = match.group(1).strip()
-                    if content:
-                        display_parts.append(content)
+            # 简化提取逻辑：优先提取"给人看"标签，只显示核心内容
+            display_content = ""
             
-            # 组合所有内容
-            if display_parts:
-                display_content = " | ".join(display_parts)
-            else:
-                # fallback：提取立场后的第一句话
+            # 优先尝试提取"给人看"标签
+            match = re.search(r'[【\[]给人看[】\]：:]?\s*([^\n【\[\]】]+)', response.content)
+            if match:
+                display_content = match.group(1).strip()
+            
+            # 如果没有"给人看"，尝试提取"核心观点"
+            if not display_content:
+                match = re.search(r'[【\[]核心观点[】\]：:]?\s*([^\n【\[\]】]+)', response.content)
+                if match:
+                    display_content = match.group(1).strip()
+            
+            # 如果还是没有，fallback：提取立场后的第一句话
+            if not display_content:
                 display_content = re.sub(r'[\[【]立场[：:]?[^\]】\n]*[\]】]?\s*', '', response.content).strip()
                 display_content = re.sub(r'[【\[][^】\]]*[\]：:]*\s*', '', display_content).strip()
                 if '\n' in display_content:
                     display_content = display_content.split('\n')[0].strip()
+            
+            # 清理残留的符号和空格
+            display_content = re.sub(r'[】\]]+\s*$', '', display_content).strip()
+            display_content = re.sub(r'\s*\|\s*$', '', display_content).strip()
+            display_content = re.sub(r'[？？]+\s*$', '', display_content).strip()
             
             # 截断显示（稍微长一点）
             content_preview = display_content[:150] + "..." if len(display_content) > 150 else display_content
@@ -2237,6 +2384,21 @@ class ConferenceMode(BaseMode):
         if not recent:
             return ""
         return "\n".join([f"[{m.agent_id}]: {m.content[:200]}..." if len(m.content) > 200 else f"[{m.agent_id}]: {m.content}" for m in recent])
+    
+    def _get_agent_previous_speeches(self, agent_id: str) -> str:
+        """获取某个代理之前的所有发言（用于避免重复）"""
+        messages = self.whiteboard.get_messages()
+        # 筛选该代理的消息
+        agent_messages = [m for m in messages if m.agent_id == agent_id and m.message_type == "normal"]
+        if not agent_messages:
+            return ""
+        # 最多显示最近5条发言
+        recent = agent_messages[-5:] if len(agent_messages) > 5 else agent_messages
+        lines = []
+        for i, m in enumerate(recent, 1):
+            content = m.content[:150] if len(m.content) > 150 else m.content
+            lines.append(f"第{i}次发言: {content}")
+        return "\n".join(lines)
     
     def _check_interrupt(self, content: str) -> bool:
         """检查叫停"""
@@ -2535,6 +2697,68 @@ class ConferenceMode(BaseMode):
                 pass
         
         return [{"step_id": 1, "description": proposal[:200], "expected_output": "执行结果", "suggested_tools": []}]
+    
+    async def _serial_summary_phase(self, question: str):
+        """会议模式结束后转入串行模式进行总结"""
+        print(f"\n[会议→串行] 会议讨论完成，转入串行模式进行总结...")
+        
+        # 收集会议讨论信息
+        messages = self.whiteboard.get_messages()
+        normal_msgs = [m for m in messages if m.message_type == "normal"]
+        
+        # 构建讨论文本
+        discussion_text = "\n".join([
+            f"[{m.agent_id}]: {m.content}"
+            for m in normal_msgs
+        ])
+        
+        # 提取提案（如果有）
+        proposals = []
+        if hasattr(self, '_extract_proposals'):
+            try:
+                agents = self.agent_pool.get_enabled_agents()
+                proposals = await self._extract_proposals(agents, normal_msgs)
+            except:
+                pass
+        
+        # 议程结论（如果有）
+        agenda_conclusions = []
+        if hasattr(self.whiteboard, 'get_agenda_conclusions'):
+            agenda_conclusions = self.whiteboard.get_agenda_conclusions()
+        
+        # 复盘结果（如果有）
+        review_synthesis = ""
+        if hasattr(self, '_context_review_synthesis'):
+            review_synthesis = getattr(self, '_context_review_synthesis', "")
+        elif hasattr(self, '_review_synthesis_result'):
+            review_synthesis = getattr(self, '_review_synthesis_result', "")
+        
+        print(f"  收集信息：{len(normal_msgs)} 条讨论，{len(proposals)} 个提案，议程结论：{len(agenda_conclusions)} 个")
+        
+        # 创建串行模式实例并执行
+        serial_mode = EnhancedSerialMode(
+            self.agent_pool,
+            self.whiteboard,
+            self.workspace,
+            self.tool_router,
+            self.config
+        )
+        
+        # 调用串行模式，传递会议讨论信息
+        result = await serial_mode.execute(
+            question=question,
+            proposals=proposals,
+            agenda_conclusions=agenda_conclusions,
+            discussion=discussion_text,
+            review_synthesis=review_synthesis
+        )
+        
+        # 将串行模式的结果合并到当前结果中
+        if result.success and result.final_resolution:
+            self.whiteboard.set_final_resolution(result.final_resolution)
+            print(f"\n[串行总结完成] {result.final_resolution[:150]}...")
+        else:
+            print(f"\n[串行总结失败] {result.error or '未知错误'}")
     
     async def _auto_serial_phase(self, question: str):
         """自动转入串行执行"""

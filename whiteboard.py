@@ -1951,8 +1951,15 @@ class Whiteboard:
                 return self._agenda[self._current_agenda_index].copy()
             return None
     
-    def vote_end_current_agenda(self, agent_id: str, agree: bool, reason: str = "") -> Dict:
-        """投票结束当前议程"""
+    def vote_end_current_agenda(self, agent_id: str, agree: bool, reason: str = "", total_enabled_agents: int = 0) -> Dict:
+        """投票结束当前议程
+        
+        Args:
+            agent_id: 投票代理ID
+            agree: 是否同意结束
+            reason: 原因
+            total_enabled_agents: 启动的总代理数量（用于计算阈值）
+        """
         with self._lock:
             if self._current_agenda_index >= len(self._agenda):
                 return {"success": False, "error": "没有当前议程"}
@@ -1973,17 +1980,20 @@ class Whiteboard:
             })
             self._version += 1
             
-            # 统计结果
-            total_agents = len(self._agent_contributions) or 1
+            # 使用传入的总代理数，否则回退到贡献代理数
+            total_agents = total_enabled_agents if total_enabled_agents > 0 else (len(self._agent_contributions) or 1)
             agree_count = sum(1 for v in current["end_votes"] if v["agree"])
             agree_ratio = agree_count / total_agents
+            
+            # 需要超过一半（>50%）才能结束
+            should_end = agree_ratio > 0.5
             
             return {
                 "success": True,
                 "agree_count": agree_count,
                 "total_agents": total_agents,
                 "agree_ratio": agree_ratio,
-                "should_end": agree_ratio >= 0.5  # 50%同意则结束
+                "should_end": should_end
             }
     
     def check_agenda_end_consensus(self) -> Tuple[bool, float]:
