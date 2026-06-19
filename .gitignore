@@ -1,2 +1,5 @@
 config.yaml
+temp_workspaces/__pycache__/
+*.pyc
 temp_workspaces/
+plugins/workspace/file_ops.py.bak

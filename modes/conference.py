@@ -70,6 +70,8 @@ class ConferenceMode(BaseMode):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._tui = None  # Rich TUI 实例（可选）
+        self._agent_runtimes: Dict[str, 'RunState'] = {}  # 每代理运行状态
         self.conf_config: ConferenceConfig = self.config.conference
         self.prompts: PromptsConfig = self.config.prompts
         
@@ -138,6 +140,9 @@ class ConferenceMode(BaseMode):
         
         # 连续工具失败计数
         self._consecutive_tool_failures: Dict[str, int] = {}
+
+        # 每代理持久化对话（用于 LLM KV Cache 复用）
+        self._agent_conversations: Dict[str, List[Dict]] = {}
     
     def _load_intensity_config(self) -> IntensityConfig:
         """加载争吵强度配置"""
@@ -179,45 +184,104 @@ class ConferenceMode(BaseMode):
             enable_compare_options=cfg.get('enable_compare_options', True),
             min_options_for_compare=cfg.get('min_options_for_compare', 2)
         )
-    
+
+    def set_tui(self, tui):
+        """关联 Rich TUI 实例（可选）"""
+        self._tui = tui
+
+    def _log(self, text: str, end: str = "\n"):
+        """输出到 TUI（如果有）或 stdout"""
+        if self._tui:
+            self._tui.log(text)
+        else:
+            print(text, end=end)
+
+    def _log_agent(self, agent_id: str, stance: str, content: str, color: str = ""):
+        """输出代理发言到 TUI 或 stdout"""
+        if self._tui:
+            self._tui.log_agent(agent_id, stance, content, color)
+        else:
+            if color:
+                print(f"  {agent_id} [{color}{stance}\033[0m] {content}")
+            else:
+                print(f"  {agent_id} [{stance}] {content}")
+
+    def _update_status(self, text: str):
+        """更新 TUI 状态栏或打印状态"""
+        if self._tui:
+            self._tui.update_status(text)
+        else:
+            print(f"\n{text}")
+
     async def execute(self, question: str) -> ModeResult:
         """执行会议模式"""
         self._is_running = True
         self._start_time = time.time()
-        
+
         self._initialize(question)
         self.whiteboard.clear_consensus()
-        
-        # 初始评估任务复杂度
-        await self._assess_task_complexity(question)
-        
+
+        # ===== 0. 动态代理选择：复杂度 × 节省偏好 =====
+        complexity_score = await self._assess_task_complexity(question)
+        savings = getattr(self.config, 'user_savings', 5)
+        target_count = self._calc_agent_count(complexity_score, savings)
+
+        all_agents = self.agent_pool.get_enabled_agents()
+        disabled_agents = []
+        if target_count < len(all_agents):
+            selected = self._select_agents_by_diversity(all_agents, target_count)
+            selected_ids = {a.id for a in selected}
+            disabled_agents = [a for a in all_agents if a.id not in selected_ids]
+            for agent in disabled_agents:
+                agent.enabled = False
+            self._log(f"[动态选择] 复杂度 {complexity_score:.0f}/100 × 节省{savings} → "
+                  f"激活 {len(selected)}/{len(all_agents)} 代理")
+            self._log(f"  激活: {', '.join(a.id for a in selected)}")
+        else:
+            self._log(f"[动态选择] 复杂度 {complexity_score:.0f}/100 → 激活全部 {len(all_agents)} 代理")
+
         try:
-            # === 新增：专属提示词生成阶段 ===
-            print("\n[专属提示词] 正在为代理生成个性化立场提示词...")
-            await self._generate_agent_stance_prompts(question)
-            
+            # === 项目探索：如有 project_dir，先扫描文件结构注入讨论 ===
+            project_dir = getattr(self.tool_router, 'project_dir', '') if self.tool_router else ''
+            if project_dir:
+                self._log(f"[项目探索] 扫描 {project_dir} 文件结构...")
+                try:
+                    structure = await self.tool_router.execute("temp_file_search",
+                        {"pattern": "*", "mode": "glob", "max_results": 50},
+                        "system", self.whiteboard)
+                    if structure:
+                        self.whiteboard.add_message(agent_id="system", content=
+                            f"[项目文件结构]\n{str(structure)[:1000]}", message_type="info")
+                        self._log(f"  发现文件结构，已注入讨论上下文")
+                except Exception as e:
+                    self._log(f"  [探索] 跳过: {e}")
+
+            # === DReaMAD 风格双阶段立场生成 ===
+            self._log("[立场生成] 战略分析 + 视角多样化（DReaMAD + CFMAD 风格）...")
+            await self._generate_stances_dreamad(question)
+
             # === 议程生成阶段 ===
-            print("\n[议程生成] 正在讨论生成会议议程...")
+            self._log("[议程生成] 正在讨论生成会议议程...")
             agenda_items = await self._generate_agenda(question)
-            
+
             if agenda_items:
                 self.whiteboard.set_agenda(agenda_items)
-                print(f"\n[议程已设置] 共 {len(agenda_items)} 个议程项：")
+                self._log(f"[议程已设置] 共 {len(agenda_items)} 个议程项：")
                 for i, item in enumerate(agenda_items, 1):
-                    print(f"  {i}. {item.get('title', '未知')}")
+                    self._log(f"  {i}. {item.get('title', '未知')}")
                     if item.get('description'):
-                        print(f"     {item['description'][:50]}...")
-                
+                        self._log(f"     {item['description'][:50]}...")
+
                 # === 议程讨论循环 ===
                 while True:
                     current_agenda = self.whiteboard.get_current_agenda_item()
                     if not current_agenda:
-                        print("\n[所有议程已完成]")
+                        self._log("[所有议程已完成]")
                         break
-                    
-                    print(f"\n[当前议程] {current_agenda['title']}")
+
+                    self._log(f"[当前议程] {current_agenda['title']}")
                     if current_agenda.get('description'):
-                        print(f"  描述：{current_agenda['description']}")
+                        self._log(f"  描述：{current_agenda['description']}")
                     
                     # === 子问题投票 ===
                     sub_questions = current_agenda.get('sub_questions', [])
@@ -255,8 +319,9 @@ class ConferenceMode(BaseMode):
             if not self.whiteboard.get_final_resolution():
                 await self._force_resolution(question)
             
-            # 直接进入串行总结模式（不需要判断）
-            await self._serial_summary_phase(question)
+            # 检测是否需要串行执行
+            if self._should_continue_serial and self._extracted_steps:
+                await self._auto_serial_phase(question)
             
             # 保存会话数据到文件
             self._save_session_data(question)
@@ -266,157 +331,10 @@ class ConferenceMode(BaseMode):
         except Exception as e:
             return ModeResult(success=False, final_resolution="", error=str(e))
         finally:
+            # 恢复被临时禁用的代理
+            for agent in disabled_agents:
+                agent.enabled = True
             self._is_running = False
-    
-    async def _generate_agent_stance_prompts(self, question: str):
-        """生成代理专属立场提示词 - 并行生成，确保立场多样对立"""
-        agents = self.agent_pool.get_enabled_agents()
-        if len(agents) < 2:
-            return
-        
-        total_agents = len(agents)
-        print(f"  共 {total_agents} 个代理参与立场生成")
-        
-        # 第一阶段：并行生成立场（AI动态生成，不预分配）
-        print("\n[立场生成] AI动态生成独特立场提示词...")
-        
-        async def generate_stance(agent, existing_stances_text=""):
-            """单个代理动态生成立场"""
-            existing_info = ""
-            if existing_stances_text:
-                existing_info = f"""
-【已生成的立场】（你应该选择不同的立场，形成对比或对立）
-{existing_stances_text}
-"""
-            
-            stance_prompt = f"""请为以下问题生成一个独特的立场提示词。
-
-【问题】{question}
-
-【你的性格】{agent.get_personality_prompt()}
-{existing_info}
-【要求】
-1. 生成一句15字以内的立场提示词，体现你的独特视角
-2. {"你必须与已有立场不同，形成对比或对立" if existing_stances_text else "根据问题性质，选择支持/反对/质疑/中立等立场"}
-3. 立场要鲜明，不要模棱两可
-4. 直接输出你的立场提示词，不要解释
-
-【示例】
-- "全力支持，强调核心价值"
-- "坚决反对，指出重大风险"
-- "质疑假设，追问更多依据"
-- "中立观望，等待更多数据"
-"""
-            try:
-                response = await agent.call_api(
-                    [{"role": "user", "content": stance_prompt}],
-                    temperature=1.0
-                )
-                
-                if response.success and response.content:
-                    content = response.content.strip().strip('"\'""''')
-                    if '\n' in content:
-                        content = content.split('\n')[0].strip()
-                    if len(content) > 25:
-                        content = content[:25]
-                    return (agent.id, content)
-            except:
-                pass
-            return (agent.id, "独立思考，理性分析")
-        
-        # 第一轮：并行生成立场
-        tasks = [generate_stance(agent) for agent in agents]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # 收集结果
-        final_stances = {}
-        stances_list = []
-        for result in results:
-            if result and not isinstance(result, Exception):
-                agent_id, stance = result
-                final_stances[agent_id] = stance
-                stances_list.append({"agent_id": agent_id, "stance": stance})
-                print(f"  [{agent_id}] {stance}")
-        
-        # 第二阶段：检查重复并重新生成（并行）
-        print("\n[立场去重] 检查并调整重复立场...")
-        
-        stance_counts = {}
-        for s in stances_list:
-            key = s["stance"][:10]
-            stance_counts[key] = stance_counts.get(key, 0) + 1
-        
-        need_regenerate = []
-        for s in stances_list:
-            key = s["stance"][:10]
-            if stance_counts[key] > 1:
-                need_regenerate.append(s["agent_id"])
-        
-        if need_regenerate:
-            print(f"  发现 {len(need_regenerate)} 个重复立场，重新生成...")
-            
-            # 构建已存在的立场文本
-            existing_stances_text = "\n".join([
-                f"  - {s['agent_id']}: {s['stance']}"
-                for s in stances_list
-                if s['agent_id'] not in need_regenerate
-            ])
-            
-            async def regenerate_stance(agent_id):
-                for agent in agents:
-                    if agent.id == agent_id:
-                        response = await agent.call_api(
-                            [{"role": "user", "content": f"生成一个与已有立场完全不同的立场提示词：\n问题：{question}\n\n已有立场：\n{existing_stances_text}\n\n直接输出新立场（15字内）"}],
-                            temperature=1.2
-                        )
-                        if response.success and response.content:
-                            new_stance = response.content.strip().strip('"\'""''')[:25]
-                            if '\n' in new_stance:
-                                new_stance = new_stance.split('\n')[0].strip()
-                            return (agent_id, new_stance)
-                return None
-            
-            regen_tasks = [regenerate_stance(aid) for aid in need_regenerate]
-            regen_results = await asyncio.gather(*regen_tasks, return_exceptions=True)
-            
-            for result in regen_results:
-                if result and not isinstance(result, Exception):
-                    agent_id, new_stance = result
-                    if agent_id:
-                        final_stances[agent_id] = new_stance
-                        print(f"  [{agent_id}] → {new_stance}")
-        
-        # 第三阶段：验证立场多样性
-        print("\n[立场验证] 检查立场多样性...")
-        
-        unique_stances = set()
-        for stance in final_stances.values():
-            unique_stances.add(stance[:8])
-        
-        diversity_ratio = len(unique_stances) / len(final_stances) if final_stances else 0
-        print(f"  立场多样性: {diversity_ratio:.1%} ({len(unique_stances)}/{len(final_stances)} 独特)")
-        
-        if diversity_ratio < 0.7:
-            print("  [警告] 立场多样性不足，建议重新讨论")
-        else:
-            print("  [通过] 立场多样性满足要求")
-        
-        # 输出最终结果
-        print("\n【立场提示词分配结果】")
-        for agent in agents:
-            if agent.id in final_stances:
-                print(f"  {agent.id}: {final_stances[agent.id]}")
-        
-        # 应用立场提示词
-        for agent_id, stance in final_stances.items():
-            if agent_id in self._agent_states:
-                self._agent_states[agent_id].stance_instruction = stance
-                for agent in agents:
-                    if agent.id == agent_id:
-                        agent.custom_stance = stance
-                        break
-        
-        print(f"\n[完成] 已为 {len(final_stances)} 个代理分配专属立场提示词")
     
     async def _vote_sub_questions(self, agenda: Dict, sub_questions: List[str], question: str) -> List[str]:
         """投票选择要讨论的子问题"""
@@ -870,10 +788,10 @@ class ConferenceMode(BaseMode):
         """重置状态，清除上一个议程的记忆，确保每个议程独立讨论"""
         # 清除白板上的讨论消息（保留议程列表和主话题）
         self.whiteboard.clear_discussion_messages()
-        
+
         # 清除共识状态
         self.whiteboard.clear_consensus()
-        
+
         # 重置代理状态，清除上一个议程的记忆
         for agent_id, state in self._agent_states.items():
             state.speech_count = 0
@@ -883,15 +801,15 @@ class ConferenceMode(BaseMode):
             state.key_points = []
             state.opinions = []
             state.references = []
-        
+
         # 清除步骤列表
         self._extracted_steps = []
-        
+
         # 重置投票和状态标记
         self._should_stop = False
         self._end_votes = set()
         self._ended_agents = set()
-        
+
         print("  [状态重置] 已清除上一议程记忆")
     
     def _initialize(self, question: str):
@@ -909,6 +827,11 @@ class ConferenceMode(BaseMode):
         # 初始化演化引擎
         self._evolution_engine = EvolutionEngine(self.whiteboard)
         
+        # 初始化运行状态
+        from run_state import RunState
+        for agent in agents:
+            self._agent_runtimes[agent.id] = RunState()
+
         # 先初始化代理状态
         for agent in agents:
             self.whiteboard.init_agent_contribution(agent.id)
@@ -956,20 +879,286 @@ class ConferenceMode(BaseMode):
                 self._agent_states[agent.id].stance = ""
                 self._agent_states[agent.id].stance_instruction = ""
     
-    async def _assess_task_complexity(self, question: str):
-        """评估任务复杂度"""
-        # 基于问题长度和关键词简单评估
+    async def _assess_task_complexity(self, question: str) -> float:
+        """多维度评估任务复杂度（0-100），返回分数用于动态代理选择"""
+        # 维度1：问题长度（0-30）
         length_factor = min(len(question) / 50 * 20, 30)
-        
+
+        # 维度2：关键词密度（0-30）
         complexity_keywords = [
-            "架构", "设计", "重构", "优化", "分析", "评估", 
-            "权衡", "决策", "策略", "方案", "比较"
+            "架构", "设计", "重构", "优化", "分析", "评估",
+            "权衡", "决策", "策略", "方案", "比较",
+            "实现", "部署", "迁移", "集成", "配置"
         ]
         keyword_factor = sum(5 for kw in complexity_keywords if kw in question)
-        
-        complexity = min(100, 20 + length_factor + keyword_factor)
+        keyword_factor = min(keyword_factor, 30)
+
+        # 维度3：问题歧义度（0-20）— 问句类型
+        open_ended = any(kw in question for kw in ["怎样", "如何", "什么", "哪种", "比较", "评价"])
+        multi_part = question.count("与") + question.count("和") + question.count("、")
+        ambiguity = 10 if open_ended else 0
+        ambiguity += min(multi_part * 5, 10)
+
+        # 维度4：领域专业度（0-20）
+        domain_keywords = [
+            "算法", "协议", "框架", "数据库", "分布式", "并发",
+            "安全", "加密", "机器学习", "神经网络", "API", "架构设计"
+        ]
+        domain_factor = sum(3 for kw in domain_keywords if kw in question)
+        domain_factor = min(domain_factor, 20)
+
+        complexity = min(100, 10 + length_factor + keyword_factor + ambiguity + domain_factor)
+
+        # DReaMAD 风格：用 LLM 快速验证复杂度判断（只在关键词匹配模糊时触发）
+        if 30 <= complexity <= 70 and len(question) > 30:
+            try:
+                agents = self.agent_pool.get_enabled_agents()
+                if agents:
+                    verify_prompt = f"""评估以下问题的复杂度（0-100）：
+问题：{question}
+
+考虑：是否需要多角度讨论、是否涉及专业领域、是否有多种可行方案。
+只输出数字："""
+                    resp = await agents[0].call_api(
+                        [{"role": "user", "content": verify_prompt}],
+                        temperature=0.1, max_tokens=10
+                    )
+                    if resp.success and resp.content:
+                        import re
+                        nums = re.findall(r'\d+', resp.content)
+                        if nums:
+                            llm_score = min(100, int(nums[0]))
+                            # 加权平均：关键词评估 60% + LLM 评估 40%
+                            complexity = int(complexity * 0.6 + llm_score * 0.4)
+            except Exception:
+                pass  # LLM 验证失败时用关键词评估结果
+
+        complexity = min(100, max(10, complexity))
         self.intensity.update_task_complexity(complexity)
-    
+        return complexity
+
+    def _calc_agent_count(self, complexity: float, savings: int) -> int:
+        """动态代理数量公式：复杂度 × 节省偏好
+
+        Args:
+            complexity: 0-100 任务复杂度
+            savings: 1-10 用户节省偏好（1=最全面，10=最省钱）
+        Returns:
+            3-16 建议代理数量
+        """
+        min_agents = 3
+        max_agents = 16
+        savings_ratio = (savings - 1) / 9  # 0.0 ~ 1.0
+
+        # 核心公式：复杂度越高代理越多，节省偏好越高代理越少
+        # savings_factor: savings=1→1.0(全量), savings=5→0.7, savings=10→0.4
+        savings_factor = 1.0 - savings_ratio * 0.6
+
+        # 线性插值：complexity=10 → 接近min, complexity=100 → 接近max×savings_factor
+        target = min_agents + (complexity / 100.0) * (max_agents - min_agents) * savings_factor
+        return max(min_agents, min(max_agents, int(round(target))))
+
+    def _select_agents_by_diversity(self, agents: list, count: int) -> list:
+        """基于人格多样性选择代理（DALC 风格：避免表征坍塌）"""
+        if len(agents) <= count:
+            return agents
+
+        # 按立场类型分组
+        from collections import defaultdict
+        by_stance = defaultdict(list)
+        for a in agents:
+            stance = getattr(a.personality, 'default_stance', 'neutral')
+            by_stance[stance].append(a)
+
+        selected = []
+        selected_ids = set()
+
+        # 第一阶段：确保每种立场至少有一个代表
+        stances = ['support', 'oppose', 'question', 'neutral']
+        for stance in stances:
+            pool = by_stance.get(stance, [])
+            available = [a for a in pool if a.id not in selected_ids]
+            if available and len(selected) < count:
+                # 选该立场中独立性最高的
+                available.sort(key=lambda a: a.personality.independence, reverse=True)
+                selected.append(available[0])
+                selected_ids.add(available[0].id)
+
+        # 第二阶段：按人格差异填充剩余名额（DALC 思想：最大化多样性）
+        remaining = [a for a in agents if a.id not in selected_ids]
+        while len(selected) < count and remaining:
+            # 对每个候选项，计算它与已选集合的最小"人格距离"
+            def diversity_score(candidate):
+                if not selected:
+                    return float('inf')
+                return min(
+                    abs(candidate.personality.cautiousness - s.personality.cautiousness) +
+                    abs(candidate.personality.empathy - s.personality.empathy) +
+                    abs(candidate.personality.abstraction - s.personality.abstraction) +
+                    abs(candidate.personality.independence - s.personality.independence)
+                    for s in selected
+                )
+            remaining.sort(key=diversity_score, reverse=True)
+            best = remaining.pop(0)
+            selected.append(best)
+            selected_ids.add(best.id)
+
+        return selected[:count]
+
+    async def _generate_stances_dreamad(self, question: str):
+        """DReaMAD × CFMAD 风格立场生成：战略分析 → 视角多样化 → 多样性检查"""
+        agents = self.agent_pool.get_enabled_agents()
+        if len(agents) < 2:
+            return
+
+        divers_config = getattr(self.config, 'diversity', None)
+        use_cfmad = divers_config and divers_config.use_cfmad_preset
+        min_dist = divers_config.min_stance_distance if divers_config else 0.5
+
+        print(f"  共 {len(agents)} 个代理参与，CFMAD预设={'开' if use_cfmad else '关'}")
+
+        # ===== Stage 1: Strategic Prior Knowledge Elicitation (DReaMAD) =====
+        # 先让一个代理分析问题的核心要素
+        first_agent = agents[0]
+        strategy_prompt = f"""分析以下问题的核心要素，输出 JSON：
+
+问题：{question}
+
+输出：
+{{
+    "core_question": "问题的核心是什么",
+    "key_dimensions": ["维度1", "维度2", ...],
+    "known_constraints": ["约束1", ...],
+    "controversial_aspects": ["可能有争议的点1", ...]
+}}"""
+        try:
+            resp = await first_agent.call_api(
+                [{"role": "user", "content": strategy_prompt}],
+                temperature=0.1, max_tokens=500
+            )
+            strategy = {}
+            if resp.success and resp.content:
+                import re, json
+                m = re.search(r'\{.*\}', resp.content, re.DOTALL)
+                if m:
+                    strategy = json.loads(m.group(0))
+                else:
+                    m = re.search(r'\[.*\]', resp.content, re.DOTALL)
+                    if m:
+                        strategy = {"key_dimensions": json.loads(m.group(0))}
+        except Exception:
+            strategy = {}
+
+        dimensions = strategy.get("key_dimensions", ["可行性", "效率", "质量"])
+        controversial = strategy.get("controversial_aspects", ["暂无明确争议点"])
+
+        # ===== Stage 2: DReaMAD 视角多样化 + 基础方向分配 =====
+        # 只分配基本方向（支持/反对/质疑/中立），具体视角由各代理自主生成
+        # CFMAD 风格：强行分配对立方向，不轮询不重复
+        direction_cycle = ["support", "oppose", "question", "oppose", "support", "question", "oppose", "support"]
+        stance_texts = {
+            "support": "你坚定支持这个方向。你的任务是提供论据和证据，说服其他人。",
+            "oppose": "你坚决反对这个方向。你的任务是找出漏洞、风险和不可行之处。",
+            "question": "你持怀疑态度。你的任务是质疑每一个假设，要求更多证据。",
+        }
+        final_stances = {}
+
+        for i, agent in enumerate(agents):
+            direction = direction_cycle[i % len(direction_cycle)]
+            stance_text = stance_texts[direction]
+
+            prompt = f"""问题：{question}
+
+关键分析维度：{', '.join(dimensions[:3])}
+争议点：{', '.join(controversial[:2])}
+
+你的立场：{stance_text}
+
+请用一句话（15字内）总结你的核心论点，直接输出："""
+
+            try:
+                resp = await agent.call_api(
+                    [{"role": "user", "content": prompt}],
+                    temperature=0.7, max_tokens=80
+                )
+                if resp.success and resp.content:
+                    text = resp.content.strip().strip('"\'""''')
+                    if '\n' in text:
+                        text = text.split('\n')[0].strip()
+                    if len(text) > 30:
+                        text = text[:30]
+                    final_stances[agent.id] = text
+                    print(f"  [{agent.id}] ({direction}) {text}")
+            except Exception:
+                final_stances[agent.id] = f"({direction})"
+
+        # ===== Stage 3: DALC 风格多样性检查 =====
+        # 用文本相似度检查立场是否足够多样
+        print(f"\n[多样性检查] 检查 {len(final_stances)} 个立场的多样性...")
+        unique_count = len(set(s[:8] for s in final_stances.values()))
+        diversity_ratio = unique_count / max(len(final_stances), 1)
+
+        if diversity_ratio < min_dist and len(final_stances) > 2:
+            print(f"  [警告] 多样性 {diversity_ratio:.0%} < 阈值 {min_dist:.0%}，重新生成相似立场...")
+            # 找出相似立场并重新生成
+            stance_items = list(final_stances.items())
+            for i, (aid, stance) in enumerate(stance_items):
+                for j, (bid, bstance) in enumerate(stance_items):
+                    if i < j and aid in final_stances and bid in final_stances:
+                        # 简单前缀相似度检查
+                        common = sum(1 for a, b in zip(stance[:8], bstance[:8]) if a == b)
+                        if common >= 6:  # 前8字中6个相同 → 很相似
+                            agent_obj = next((a for a in agents if a.id == bid), None)
+                            if agent_obj:
+                                try:
+                                    resp = await agent_obj.call_api(
+                                        [{"role": "user", "content":
+                                            f"用完全不同的角度重新生成立场（与以下立场对立）：{stance}\n"
+                                            f"问题：{question}\n直接输出新立场（15字内）："}],
+                                        temperature=1.0, max_tokens=50
+                                    )
+                                    if resp.success and resp.content:
+                                        new_s = resp.content.strip().strip('"\'""''')[:25]
+                                        if '\n' in new_s:
+                                            new_s = new_s.split('\n')[0].strip()
+                                        final_stances[bid] = new_s
+                                        print(f"  [{bid}] → {new_s}")
+                                except Exception:
+                                    pass
+
+        unique_count = len(set(s[:8] for s in final_stances.values()))
+        diversity_ratio = unique_count / max(len(final_stances), 1)
+        print(f"  最终多样性: {diversity_ratio:.0%} ({unique_count}/{len(final_stances)})")
+
+        # 应用立场
+        for agent in agents:
+            if agent.id in final_stances:
+                if agent.id in self._agent_states:
+                    self._agent_states[agent.id].stance_instruction = final_stances[agent.id]
+                agent.custom_stance = final_stances[agent.id]
+
+    def _get_opinion_divergence(self) -> float:
+        """EVINCE 风格：计算当前意见分歧度（0=完全一致，1=完全对立）"""
+        viewpoints = self.whiteboard.get_viewpoints()
+        if len(viewpoints) < 2:
+            return 0.3  # 默认中度分歧
+
+        # 统计每种立场的发言比例
+        stance_counts = {"support": 0, "oppose": 0, "question": 0, "neutral": 0}
+        for vp in viewpoints:
+            vtype = vp.get("type", "neutral")
+            stance_counts[vtype] = stance_counts.get(vtype, 0) + 1
+
+        total = sum(stance_counts.values())
+        if total == 0:
+            return 0.3
+
+        # 用支持/反对比例的熵来衡量分歧度
+        pro_ratio = stance_counts["support"] / total
+        con_ratio = stance_counts["oppose"] / total
+        divergence = max(pro_ratio, con_ratio) - 0.5  # 0~0.5 范围
+        return min(1.0, max(0.0, divergence * 2 + 0.2))
+
     async def _discussion_loop(self, question: str, current_agenda: Optional[Dict] = None):
         """并发独立思考 - 完整防卡死机制，支持议程"""
         agents = self.agent_pool.get_enabled_agents()
@@ -1005,6 +1194,8 @@ class ConferenceMode(BaseMode):
         
         speak_counts = {a.id: 0 for a in agents}
         total_speaks = 0
+        from moderator import Moderator
+        _moderator = Moderator()
         self._end_votes = set()
         self._ended_agents = set()  # 已发送终止符号的代理，不再发言
         self._agenda_end_votes = {}  # 议程结束投票
@@ -1027,9 +1218,8 @@ class ConferenceMode(BaseMode):
             agenda_progress = self.whiteboard.get_agenda_progress()
             agenda_info = f" | 议程:{agenda_progress['resolved']+1}/{agenda_progress['total']}" if agenda_progress['total'] > 0 else ""
             
-            # 简洁输出
-            print(f"\n{intensity_bar} | 活跃:{active}/{len(agents)} | 结束意向:{end_pct:.0f}%{agenda_info}")
-            print("-> ", end="", flush=True)
+            status_text = f"活跃:{active}/{len(agents)} | 结束意向:{end_pct:.0f}%{agenda_info}"
+            self._update_status(status_text)
         
         async def agent_think_loop(agent: Agent):
             """单个代理的持续思考循环"""
@@ -1092,6 +1282,10 @@ class ConferenceMode(BaseMode):
                     show_status_bar()
                     
                     if result:
+                        # 主持人观察
+                        _astate = self._agent_states.get(agent.id)
+                        _moderator.observe(agent.id, getattr(_astate, 'stance', ''), result)
+
                         # 重复检测
                         is_repeat = self._check_repeat(agent.id, result)
                         if is_repeat:
@@ -1209,10 +1403,9 @@ class ConferenceMode(BaseMode):
                             # 同时计入结束意向
                             if agent.id not in self._end_votes:
                                 self._end_votes.add(agent.id)
-                            # 记录议程结束投票（传入总代理数）
+                            # 记录议程结束投票
                             vote_result = self.whiteboard.vote_end_current_agenda(
-                                agent.id, True, "认为当前议程讨论充分",
-                                total_enabled_agents=len(agents)  # 传入启动的总代理数
+                                agent.id, True, "认为当前议程讨论充分"
                             )
                             if vote_result["success"]:
                                 print(f"\n[议程结束投票] {agent.id} 同意结束当前议程")
@@ -1252,7 +1445,16 @@ class ConferenceMode(BaseMode):
                             print(f"  总发言: {total_speaks} 次")
                             print(f"  结束票: {len(self._end_votes)}/{len(agents)}")
                             self._should_stop = True
-                            self._need_agenda_vote = True  # 标记需要议程投票
+                            self._need_agenda_vote = True
+                            return
+
+                        # MACI 主持人：平台检测 → 自动推进议程
+                        if _moderator.should_advance(min_rounds) and total_speaks >= len(agents) * min_rounds:
+                            status = _moderator.get_status()
+                            print(f"\n[主持人] 讨论平台期，自动推进议程")
+                            print(f"  分歧:{status['分歧度']} 重叠:{status['重叠度']} 质量:{status['论证质量']}")
+                            self._should_stop = True
+                            self._need_agenda_vote = True
                             return
                             
                 except Exception as e:
@@ -1383,16 +1585,26 @@ class ConferenceMode(BaseMode):
                 self.whiteboard.advance_agenda()
                 print(f"\n[议程推进] 进入下一个议程")
             
-            # 5. 只有最后一个议程才复盘，然后进入串行模式总结
+            # 5. 只有最后一个议程才复盘
             if is_last_agenda:
-                print("[最终复盘] 所有议程已完成，进行复盘讨论...")
+                print("[最终复盘] 所有议程已完成，进行最终复盘")
                 
-                # 复盘：多代理讨论细化方案
-                await self._review_debate(agents, ranked_proposals, question)
+                has_debate = await self._review_debate(agents, ranked_proposals, question)
                 
-                # 无论是否有分歧，都进入串行模式总结
-                print("\n[串行模式] 进入串行模式生成最终总结...")
-                await self._generate_final_conclusion(agents, question, current_agenda, ranked_proposals)
+                if has_debate:
+                    # 有争论，继续讨论
+                    print("\n[复盘] 存在分歧，继续讨论...")
+                    self._should_stop = False
+                    self._end_votes = set()
+                    self._ended_agents = set()  # 重置已结束代理列表，允许重新发言
+                    # 获取下一个议程继续讨论
+                    next_agenda = self.whiteboard.get_current_agenda_item()
+                    if next_agenda:
+                        await self._discussion_loop(question, next_agenda)
+                else:
+                    # 无争论，串行输出结论
+                    print("\n[复盘] 达成共识，生成最终结论")
+                    await self._generate_final_conclusion(agents, question, current_agenda, ranked_proposals)
                     
         except Exception as e:
             print(f"  [议程投票错误] {e}")
@@ -1521,168 +1733,41 @@ class ConferenceMode(BaseMode):
                        key=lambda x: x[1], reverse=True)
         return ranked
     
-    async def _review_debate(self, agents, ranked_proposals: List[tuple], question: str):
-        """复盘讨论 - 多代理共同细化方案，结果存储到白板供串行模式使用"""
+    async def _review_debate(self, agents, ranked_proposals: List[tuple], question: str) -> bool:
+        """复盘讨论，返回是否有争论"""
         proposals_text = "\n".join([f"第{i+1}名: {p[0]} (得分{p[1]})" 
                                    for i, p in enumerate(ranked_proposals)])
         
-        print("\n[复盘讨论] 多代理共同细化方案...")
+        # 快速询问是否有分歧
+        agree_count = 0
+        disagree_count = 0
         
-        # 收集所有讨论内容
-        all_discussions = []
-        
-        # 第1轮：每个代理发表细化意见（并行）
-        round1_tasks = []
-        for agent in agents[:min(5, len(agents))]:
-            personality = agent.get_personality_prompt()
-            stance = getattr(self._agent_states.get(agent.id, {}), 'stance_instruction', '中立')
-            
-            prompt = self.prompts.review_debate.format(
-                question=question,
-                proposals_text=proposals_text,
-                personality=personality,
-                stance=stance
-            )
-            round1_tasks.append(self._agent_review_speak(agent, prompt))
-        
-        # 并行执行
-        round1_results = await asyncio.gather(*round1_tasks, return_exceptions=True)
-        
-        for result in round1_results:
-            if result and not isinstance(result, Exception):
-                agent_id, content = result
-                if content:
-                    all_discussions.append(f"[{agent_id}]: {content}")
-                    print(f"  [{agent_id}]: {content[:80]}...")
-        
-        # 检查是否有明显分歧，有则继续第2轮
-        has_debate = self._check_review_debate(all_discussions)
-        
-        if has_debate:
-            # 第2轮：继续讨论，回应他人观点
-            print("\n[复盘第2轮] 继续细化讨论...")
-            
-            previous_discussion = "\n".join(all_discussions[-10:])
-            
-            round2_tasks = []
-            for agent in agents[:min(5, len(agents))]:
-                personality = agent.get_personality_prompt()
-                
-                prompt = self.prompts.review_round.format(
-                    round=2,
-                    question=question,
-                    proposals_text=proposals_text,
-                    previous_discussion=previous_discussion,
-                    personality=personality
+        for agent in agents[:min(5, len(agents))]:  # 最多问5个代理
+            prompt = self.prompts.review_debate.format(question=question, proposals_text=proposals_text)
+
+            try:
+                response = await agent.call_api(
+                    [{"role": "user", "content": prompt}],
+                    tools=None,
+                    temperature=0.3
                 )
-                round2_tasks.append(self._agent_review_speak(agent, prompt))
-            
-            round2_results = await asyncio.gather(*round2_tasks, return_exceptions=True)
-            
-            for result in round2_results:
-                if result and not isinstance(result, Exception):
-                    agent_id, content = result
-                    if content:
-                        all_discussions.append(f"[{agent_id}]: {content}")
-                        print(f"  [{agent_id}]: {content[:80]}...")
+                
+                if response.success and response.content:
+                    if "同意" in response.content and "需要讨论" not in response.content:
+                        agree_count += 1
+                        print(f"  [{agent.id}] 同意排序结果")
+                    else:
+                        disagree_count += 1
+                        print(f"  [{agent.id}] 需要讨论: {response.content[:50]}...")
+            except Exception as e:
+                pass
         
-        # 综合各方意见
-        print("\n[复盘综合] 生成细化后的方案...")
-        synthesizer = agents[0]
-        discussion = "\n".join(all_discussions)
-        
-        synthesize_prompt = self.prompts.review_synthesize.format(
-            question=question,
-            discussion=discussion,
-            proposals_text=proposals_text
-        )
-        
-        # 存储复盘讨论内容到白板
-        self.whiteboard.add_review_record(
-            content=discussion,
-            review_type="discussion"
-        )
-        
-        try:
-            response = await synthesizer.call_api(
-                [{"role": "user", "content": synthesize_prompt}],
-                tools=None,
-                temperature=0.3
-            )
-            
-            if response.success and response.content:
-                # 尝试解析JSON
-                import json
-                import re
-                content = response.content
-                match = re.search(r'\{.*\}', content, re.DOTALL)
-                if match:
-                    try:
-                        result = json.loads(match.group())
-                        directions = result.get("directions", [])
-                        details = result.get("details", "")
-                        next_actions = result.get("next_actions", [])
-                        
-                        print("\n【复盘结果】")
-                        if directions:
-                            print("方案方向：")
-                            for i, d in enumerate(directions, 1):
-                                print(f"  {i}. {d}")
-                        if details:
-                            print(f"\n关键细节：{details[:200]}")
-                        if next_actions:
-                            print(f"\n后续事项：{', '.join(next_actions[:5])}")
-                        
-                        # 存储复盘综合结果到白板，供串行模式使用
-                        self.whiteboard.add_review_record(
-                            content=json.dumps({
-                                "directions": directions,
-                                "details": details,
-                                "next_actions": next_actions
-                            }, ensure_ascii=False),
-                            review_type="synthesis"
-                        )
-                    except json.JSONDecodeError:
-                        print(f"\n{content[:300]}")
-                        self.whiteboard.add_review_record(
-                            content=content[:500],
-                            review_type="synthesis"
-                        )
-        except Exception as e:
-            print(f"  综合失败: {e}")
-    
-    async def _agent_review_speak(self, agent, prompt: str) -> tuple:
-        """单个代理发表复盘意见"""
-        try:
-            response = await agent.call_api(
-                [{"role": "user", "content": prompt}],
-                tools=None,
-                temperature=0.5
-            )
-            if response.success and response.content:
-                return (agent.id, response.content)
-        except:
-            pass
-        return (agent.id, "")
-    
-    def _check_review_debate(self, discussions: List[str]) -> bool:
-        """检查复盘讨论是否有分歧"""
-        # 简单检测：是否有反对意见或不同观点
-        debate_keywords = ["但是", "不过", "问题", "风险", "反对", "质疑", "建议", "修改", "整合"]
-        debate_count = 0
-        
-        for d in discussions:
-            for kw in debate_keywords:
-                if kw in d:
-                    debate_count += 1
-                    break
-        
-        # 超过半数有细化建议则认为有讨论价值
-        return debate_count > len(discussions) // 2
+        # 如果超过1/3的人需要讨论，则有争论
+        return disagree_count > agree_count // 2
     
     async def _generate_final_conclusion(self, agents, question: str, current_agenda: Dict, 
                                          ranked_proposals: List[tuple] = None):
-        """调用串行模式生成最终结论（基于复盘结果）"""
+        """调用串行模式生成最终结论"""
         messages = self.whiteboard.get_messages()
         discussion = "\n".join([f"{m.agent_id}: {m.content[:150]}" for m in messages[-30:]])
         
@@ -1706,19 +1791,9 @@ class ConferenceMode(BaseMode):
                         "conclusion": item['conclusion']
                     })
         
-        # 获取复盘结果
-        review_records = self.whiteboard.get_review_records()
-        review_synthesis = None
-        for record in review_records:
-            if record.get('type') == 'synthesis':
-                review_synthesis = record.get('content', '')
-                break
-        
-        print("\n[串行模式] 基于复盘结果生成最终总结...")
+        print("\n[串行模式] 调用串行模式生成最终结论...")
         print(f"  传递 {len(all_proposals)} 个提议")
         print(f"  传递 {len(agenda_conclusions)} 个议程结论")
-        if review_synthesis:
-            print(f"  传递复盘综合结果")
         
         try:
             # 创建串行模式实例
@@ -1730,13 +1805,12 @@ class ConferenceMode(BaseMode):
                 config=self.config
             )
             
-            # 执行结论生成任务，传递所有上下文（包括复盘结果）
+            # 执行结论生成任务，传递所有上下文
             result = await serial_mode.execute(
                 question=question,
                 proposals=all_proposals,
                 agenda_conclusions=agenda_conclusions,
-                discussion=discussion[:2000],
-                review_synthesis=review_synthesis  # 新增：传递复盘结果
+                discussion=discussion[:2000]
             )
             
             if result and result.success and result.final_resolution:
@@ -2023,21 +2097,93 @@ class ConferenceMode(BaseMode):
                 if handled:
                     return
     
-    async def _agent_speak(self, agent: Agent, question: str, round_num: int, user_message: str = None, current_agenda: Dict = None) -> Optional[str]:
-        """代理发言 - 支持用户插话和议程上下文"""
-        import re  # 在函数开头导入
+    async def _summarize(self, title: str, text: str, max_tokens: int = 300) -> str:
+        """用第一个可用代理做摘要（CCB 风格压缩用）"""
+        agents = self.agent_pool.get_enabled_agents()
+        if not agents:
+            return ""
+        resp = await agents[0].call_api(
+            [{"role": "user", "content": f"用一句话总结以下内容（{max_tokens} token内）：\n\n{text}"}],
+            temperature=0.3, max_tokens=max_tokens
+        )
+        return resp.content.strip() if resp.success and resp.content else ""
+
+    def _build_agent_system_prompt(self, agent: Agent, question: str) -> str:
+        """构建代理的固定系统提示（只构建一次，后续轮次复用）"""
         state = self._agent_states[agent.id]
-        
-        # 根据强度调整提示词
-        intensity_hint = self._get_intensity_hint()
-        
-        # 获取讨论历史
+        template = self.prompts.conference_discussion
+
+        # 把 {discussion_history} 从模板中拆分出去（它每轮变化，放 user message）
+        if "{discussion_history}" in template:
+            before_part = template.split("{discussion_history}")[0]
+            after_part = template.split("{discussion_history}")[1]
+        else:
+            before_part = template
+            after_part = ""
+
+        # 填充固定占位符（identity, personality, topic 不随轮次改变）
+        max_rounds = getattr(self.config, 'max_rounds', 5) if hasattr(self, 'config') else 5
+        fixed_part = before_part.format(
+            identity=agent.id,
+            personality=agent.get_personality_prompt(),
+            topic=question,
+            round=1,
+            max_rounds=max_rounds
+        )
+        system_prompt = fixed_part + after_part
+
+        # 强制立场方向（从 stance_instruction 提取或使用 CFMAD 方向）
+        stance_text = getattr(state, 'stance_instruction', None) or getattr(agent, 'custom_stance', '')
+        # 从立场文本推断方向
+        direction = "中立"
+        if "support" in stance_text or "（支持）" in stance_text or "(support)" in stance_text:
+            direction = "支持"
+        elif "oppose" in stance_text or "（反对）" in stance_text or "(oppose)" in stance_text:
+            direction = "反对"
+        elif "question" in stance_text or "（质疑）" in stance_text or "(question)" in stance_text:
+            direction = "质疑"
+
+        dir_rules = {
+            "支持": "你的立场是【支持】。提供正面论据，主动反驳反对意见。",
+            "反对": "你的立场是【反对】。找出漏洞和风险，坚决质疑。",
+            "质疑": "你的立场是【质疑】。质疑每一个假设，要求证据。",
+        }
+        dir_line = dir_rules.get(direction, '你的立场是【中立】。客观分析，权衡利弊。')
+        core_line = f"核心论点：{stance_text}" if stance_text and len(stance_text) > 4 else ""
+        # 强制格式指令放在最前面，确保代理遵守
+        fmt_rule = "你的发言必须以 [立场] 开头，后面接 支持/反对/质疑 之一（不要写中立）。"
+        system_prompt = f"{fmt_rule}\n{dir_line}\n{core_line}\n\n{system_prompt}"
+
+        # 加入长期记忆（固定）
+        memory_prompt = self.whiteboard.get_long_term_memory_prompt()
+        if memory_prompt:
+            system_prompt = f"{memory_prompt}\n\n{system_prompt}"
+
+        # 约束条件（固定）
+        constraint_reminder = self._extract_constraints(question)
+        if constraint_reminder:
+            system_prompt += f"\n\n=== 约束条件（必须验证） ===\n{constraint_reminder}"
+
+        return system_prompt
+
+    async def _agent_speak(self, agent: Agent, question: str, round_num: int, user_message: str = None, current_agenda: Dict = None) -> Optional[str]:
+        """代理发言 - 持久化对话，只追加新内容，不重建历史（复用 LLM KV Cache）"""
+        import re
+        state = self._agent_states[agent.id]
+
+        # ===== 1. 首次调用：构建并缓存系统提示 =====
+        if agent.id not in self._agent_conversations:
+            system_prompt = self._build_agent_system_prompt(agent, question)
+            self._agent_conversations[agent.id] = [
+                {"role": "system", "content": system_prompt}
+            ]
+
+        conversation = self._agent_conversations[agent.id]
+
+        # ===== 2. 构建本轮 user message（只含本轮新信息） =====
         discussion_history = self._get_recent_messages(10)
-        
-        # 获取该代理之前的发言，避免重复
-        agent_previous_speeches = self._get_agent_previous_speeches(agent.id)
-        
-        # 获取议程信息
+
+        # 议程信息
         agenda_context = ""
         if current_agenda:
             agenda_context = f"""
@@ -2045,97 +2191,87 @@ class ConferenceMode(BaseMode):
 标题：{current_agenda.get('title', '未知')}
 描述：{current_agenda.get('description', '')}
 """
-            # 显示选中的子问题
             selected_qs = current_agenda.get('selected_questions', [])
             if selected_qs:
                 agenda_context += "\n【需要讨论的子问题】\n"
                 for i, sq in enumerate(selected_qs, 1):
                     agenda_context += f"  {i}. {sq}\n"
-            
-            agenda_context += "\n你可以使用 [AGENDA_END] 表示你认为当前议程讨论充分，可以进入下一个议程。"
-            
-            # 显示议程进度
+            agenda_context += "\n你可以使用 [AGENDA_END] 表示你认为当前议程讨论充分。"
             progress = self.whiteboard.get_agenda_progress()
             agenda_context += f"\n议程进度：第 {progress['resolved']+1}/{progress['total']} 个议程"
-        
-        # 获取暂存问题和子话题
+
+        # 暂存问题 / 待讨论子话题
         shelved = self.whiteboard.get_shelved_issues(status="shelved")
         sub_topics = self.whiteboard.get_sub_topics(status="pending")
-        
         context_parts = []
         if sub_topics:
             context_parts.append("待讨论子话题：" + "; ".join([s["content"][:30] for s in sub_topics[:3]]))
         if shelved:
             context_parts.append("暂存问题：" + "; ".join([s["content"][:30] for s in shelved[:3]]))
-        
         extra_context = "\n".join(context_parts) if context_parts else ""
-        
-        # 获取最大轮次配置
-        max_rounds = getattr(self.config, 'max_rounds', 5) if hasattr(self, 'config') else 5
-        
-        # 提取原始问题中的约束条件提醒
-        constraint_reminder = self._extract_constraints(question)
-        
-        prompt = self.prompts.conference_discussion.format(
-            identity=agent.id,
-            personality=agent.get_personality_prompt(),
-            topic=question,
-            round=round_num + 1,
-            max_rounds=max_rounds,
-            discussion_history=discussion_history if discussion_history else "（暂无讨论）"
-        )
-        
-        # 加入代理专属立场提示词（强制！）
-        stance_instruction = getattr(state, 'stance_instruction', None) or getattr(agent, 'custom_stance', None)
-        if stance_instruction:
-            prompt = f"""【强制立场】你必须以"{stance_instruction}"的立场发言！
-- 你的每句话都要体现这个立场
-- 如果发现你的发言与立场不符，必须重写
-- 立场是你的身份，不能违背
 
-{prompt}"""
-        
-        # 提醒代理之前说过什么，避免重复
-        if agent_previous_speeches:
-            prompt += f"\n\n=== 你之前的发言（禁止重复！） ===\n{agent_previous_speeches}\n⚠️ 你已经说过以上内容，请勿重复！若无新观点，请输出[AGENDA_END]结束议题。"
-        
-        # 加入长期记忆
-        memory_prompt = self.whiteboard.get_long_term_memory_prompt()
-        if memory_prompt:
-            prompt = f"{memory_prompt}\n\n{prompt}"
-        
-        if constraint_reminder:
-            prompt += f"\n\n=== 约束条件（必须验证） ===\n{constraint_reminder}"
-        
+        intensity_hint = self._get_intensity_hint()
+
+        # 组装本轮 user message
+        user_content = f"【第 {round_num + 1} 轮讨论】\n\n"
+        if discussion_history:
+            user_content += f"【已有讨论】\n{discussion_history}\n\n"
         if agenda_context:
-            prompt += f"\n{agenda_context}"
-        
+            user_content += f"{agenda_context}\n"
         if extra_context:
-            prompt += f"\n\n{extra_context}"
-        
+            user_content += f"{extra_context}\n"
         if intensity_hint:
-            prompt += f"\n\n当前讨论氛围：{intensity_hint}"
-        
-        # 用户插话提示
+            user_content += f"当前讨论氛围：{intensity_hint}\n"
         if user_message:
-            prompt += f"\n\n[用户插话] {user_message}\n请针对用户的插话进行回应。"
-        
-        user_msg = f"请根据以上信息发表你的观点："
-        
-        # 合并消息
-        combined_msg = f"[系统指令]\n{prompt}\n\n[用户消息]\n{user_msg}"
-        messages = [{"role": "user", "content": combined_msg}]
-        
-        # 获取工具（如果代理有允许的工具）
+            user_content += f"\n[用户插话] {user_message}\n请针对用户的插话进行回应。\n"
+
+        # 每轮当面提醒立场方向
+        _as = self._agent_states.get(agent.id)
+        if _as:
+            si = getattr(_as, 'stance_instruction', '') or getattr(agent, 'custom_stance', '')
+            if si:
+                user_content += f"\n你的立场方向：{si}\n"
+        user_content += "用 temp_file_search / temp_file_read 查代码获取实际信息。"
+
+        # CCB 风格：API 调用前执行压缩管道
+        from context_compressor import run_pipeline
+        rs = self._agent_runtimes.get(agent.id)
+        if rs:
+            conversation = await run_pipeline(conversation, self._summarize, rs)
+
+        conversation.append({"role": "user", "content": user_content})
+
+        # ===== 3. 获取工具定义 =====
         tools = None
         if self.tool_router and agent.allowed_tools:
             tools = self.tool_router.get_common_tools_for_agent(list(agent.allowed_tools))
-        
+            # 会议模式禁用搜索工具（系统已预先扫描项目结构）
+            if tools:
+                tools = [t for t in tools if t.get('function', {}).get('name', '') not in
+                         ('temp_file_search', 'code_execute', 'script_run')]
         temperature = 0.3
-        
-        response = await agent.call_api(messages, tools=tools, temperature=temperature)
-        
-        # 处理工具调用
+
+        # ===== 4. 调用 API（带退避重试） =====
+        rt = self._agent_runtimes.get(agent.id)
+        for attempt in range(4):
+            response = await agent.call_api(conversation, tools=tools, temperature=temperature)
+            if response.success:
+                if rt:
+                    rt.retry_success()
+                break
+            if rt:
+                should, wait = rt.should_retry()
+                if not should:
+                    break
+                print(f"  [重试] {agent.id} 第{attempt+1}次失败，{wait:.1f}s后重试")
+                await asyncio.sleep(wait)
+            else:
+                if attempt < 3:
+                    await asyncio.sleep(1.0)
+                else:
+                    break
+
+        # ===== 5. 处理工具调用（追加 tool messages 到 conversation） =====
         if response.success and response.tool_calls:
             for tool_call in response.tool_calls:
                 try:
@@ -2145,30 +2281,38 @@ class ConferenceMode(BaseMode):
                         agent.id,
                         self.whiteboard
                     )
-                    # 将工具结果加入消息
-                    messages.append({"role": "assistant", "content": None, "tool_calls": [tool_call]})
-                    messages.append({"role": "tool", "content": str(tool_result)})
-                    # 再次调用获取最终回复
-                    response = await agent.call_api(messages, tools=tools, temperature=temperature)
+                    conversation.append({"role": "assistant", "content": None, "tool_calls": [tool_call]})
+                    conversation.append({"role": "tool", "content": str(tool_result)})
+                    response = await agent.call_api(conversation, tools=tools, temperature=temperature)
                 except Exception as e:
                     print(f"  [工具错误] {tool_call['name']}: {e}")
-        
+
+        # ===== 6. 记录发言并更新运行状态 =====
         if response.success and response.content:
+            conversation.append({"role": "assistant", "content": response.content})
+            # 更新运行状态
+            rt = self._agent_runtimes.get(agent.id)
+            if rt:
+                rt.call_count += 1
+                if response.tool_calls:
+                    rt.tool_call_count += len(response.tool_calls)
+                if response.success:
+                    rt.retry_success()
+
             state.speak_count += 1
             state.last_speak_time = time.time()
             state.last_content = response.content
             self._last_activity_time = time.time()
-            
+
             # 解析扩展信号
             expand_match = re.search(r'\[EXPAND:\s*(.+?)\]', response.content)
             if expand_match:
                 expand_content = expand_match.group(1).strip()
                 issue = self.whiteboard.expand_issue(expand_content, agent.id)
                 print(f"  [扩展议题] {expand_content[:50]} - 待投票")
-                # 记录到演化引擎
                 if self._evolution_engine:
                     self._evolution_engine.record_speak(agent.id)
-            
+
             # 解析暂存信号
             park_match = re.search(r'\[PARK\]', response.content)
             if park_match:
@@ -2176,7 +2320,7 @@ class ConferenceMode(BaseMode):
                 if current:
                     parked = self.whiteboard.park_issue(current["id"], f"由{agent.id}提议")
                     print(f"  [暂存议题] {current['content'][:50]}")
-            
+
             # 解析恢复信号
             restore_match = re.search(r'\[RESTORE\s+(\S+)\]', response.content)
             if restore_match:
@@ -2184,80 +2328,68 @@ class ConferenceMode(BaseMode):
                 restored = self.whiteboard.restore_issue(parked_id)
                 if restored:
                     print(f"  [恢复议题] {restored['content'][:50]}")
-            
-            # 兼容旧信号
+
             sub_topic_match = re.search(r'\[子话题\]\s*(.+?)(?:\n|$)', response.content)
             if sub_topic_match:
                 sub_topic_content = sub_topic_match.group(1).strip()
                 self.whiteboard.expand_issue(sub_topic_content, agent.id)
                 print(f"  [新子话题] {sub_topic_content[:50]}")
-            
+
             msg_type = "interrupt" if "[INTERRUPT]" in response.content else "normal"
-            
-            # 提取立场和发言内容 - 兼容多种格式，冒号可选
-            # 格式: [立场：支持] 或 【立场】支持 或 [立场]支持 或 【立场：支持】
-            stance_match = re.search(r'[\[【]立场[：:]?\s*([^\]】\n]+)', response.content)
-            stance = stance_match.group(1).strip() if stance_match else "中立"
-            # 清理立场中的多余字符
-            stance = re.sub(r'[\]：:]', '', stance).strip()
-            
-            # 简化提取逻辑：优先提取"给人看"标签，只显示核心内容
-            display_content = ""
-            
-            # 优先尝试提取"给人看"标签
-            match = re.search(r'[【\[]给人看[】\]：:]?\s*([^\n【\[\]】]+)', response.content)
-            if match:
-                display_content = match.group(1).strip()
-            
-            # 如果没有"给人看"，尝试提取"核心观点"
-            if not display_content:
-                match = re.search(r'[【\[]核心观点[】\]：:]?\s*([^\n【\[\]】]+)', response.content)
-                if match:
-                    display_content = match.group(1).strip()
-            
-            # 如果还是没有，fallback：提取立场后的第一句话
-            if not display_content:
-                display_content = re.sub(r'[\[【]立场[：:]?[^\]】\n]*[\]】]?\s*', '', response.content).strip()
-                display_content = re.sub(r'[【\[][^】\]]*[\]：:]*\s*', '', display_content).strip()
-                if '\n' in display_content:
-                    display_content = display_content.split('\n')[0].strip()
-            
-            # 清理残留的符号和空格
-            display_content = re.sub(r'[】\]]+\s*$', '', display_content).strip()
-            display_content = re.sub(r'\s*\|\s*$', '', display_content).strip()
-            display_content = re.sub(r'[？？]+\s*$', '', display_content).strip()
-            
-            # 截断显示（稍微长一点）
+
+            # 提取立场 — 支持 [立场]、【立场】、或者开头直接写支持/反对/质疑
+            content_start = response.content.strip()[:30]
+            stance = "中立"
+            # 先试正规标签
+            stance_match = re.search(r'[\[【]立场[\]】]?\s*[:：]?\s*([^\n\]】]+)', response.content)
+            if stance_match:
+                s = stance_match.group(1).strip()
+                if any(kw in s for kw in ["支持", "反对", "质疑"]):
+                    stance = s[:2]
+            # 没标签则看开头关键词
+            if stance == "中立":
+                for kw in ["支持", "反对", "质疑"]:
+                    if content_start.startswith(kw):
+                        stance = kw
+                        break
+
+            # 提取摘要内容显示给用户（优先），没有则取第一句
+            human_match = re.search(r'[\[【]用户摘要[\]】]?\s*(.+)', response.content)
+            if human_match:
+                display_content = human_match.group(1).strip()
+            else:
+                display_content = re.sub(r'【[^】]+】', '', response.content).strip()
+                display_content = re.sub(r'\[立场[^\]]*\]', '', display_content).strip()
+                display_content = re.sub(r'\n+', ' ', display_content).strip()
+                if '。' in display_content:
+                    display_content = display_content.split('。')[0] + '。'
+
             content_preview = display_content[:150] + "..." if len(display_content) > 150 else display_content
-            
-            # 立场颜色标记
+
             stance_colors = {
-                "支持": "\033[32m", "反对": "\033[31m", "质疑": "\033[33m", 
+                "支持": "\033[32m", "反对": "\033[31m", "质疑": "\033[33m",
                 "补充": "\033[36m", "修正": "\033[35m", "中立": "\033[37m"
             }
             stance_color = stance_colors.get(stance[:2], "\033[37m")
             reset_color = "\033[0m"
-            
-            print(f"  {agent.id} {stance_color}[{stance}]{reset_color} {content_preview}")
-            
+
+            print(f"  {agent.id} [{stance}] {content_preview}")
+            if self._tui:
+                self._tui.log_agent(agent.id, stance, content_preview)
+
             self.whiteboard.add_message(
                 agent_id=agent.id,
                 content=response.content,
                 message_type=msg_type
             )
-            
-            # 更新贡献
+
             self.whiteboard.record_contribution(agent.id, len(response.content))
-            
-            # 追踪观点
             self._track_opinion(agent.id, response.content)
-            
-            # 更新情感温度
             self._update_emotional_temperature(response.content)
-            
+
             return response.content
-        else:
-            return None
+
+        return None
     
     def _extract_constraints(self, question: str) -> str:
         """从原始问题中提取约束条件，提醒代理验证方案是否满足"""
@@ -2283,14 +2415,29 @@ class ConferenceMode(BaseMode):
         return ""
     
     def _get_intensity_hint(self) -> str:
-        """获取强度提示（影响发言内容激烈程度，不影响并发顺序）"""
+        """EVINCE 风格动态强度提示：融合分歧度实时调整对抗层级"""
         level = self.intensity.level
+
+        # EVINCE 风格：用实时分歧度微调提示词
+        divergence = self._get_opinion_divergence()
+
+        # 分歧低时加强对抗，分歧高时适度缓和（避免无意义争吵）
+        if divergence < 0.3 and level in (IntensityLevel.MILD, IntensityLevel.HARMONY):
+            level = IntensityLevel.MODERATE  # 提升一级激发讨论
+        elif divergence > 0.8 and level in (IntensityLevel.INTENSE, IntensityLevel.FIERCE):
+            level = IntensityLevel.MODERATE  # 已经足够对立，缓和语气
+
         hints = {
-            IntensityLevel.HARMONY: "保持礼貌温和的语气，理性表达观点，尊重他人意见",
-            IntensityLevel.MILD: "可以适当表达不同意见，保持建设性讨论氛围",
-            IntensityLevel.MODERATE: "积极表达观点，可以适度反驳，推进讨论深入",
-            IntensityLevel.INTENSE: "坚持己见！强力反驳不合理观点，据理力争！",
-            IntensityLevel.FIERCE: "全力捍卫你的立场！毫不退让！激烈辩论！"
+            IntensityLevel.HARMONY:
+                "保持礼貌温和的语气，理性表达观点，尊重他人意见",
+            IntensityLevel.MILD:
+                "可以适当表达不同意见，保持建设性讨论氛围",
+            IntensityLevel.MODERATE:
+                "积极表达观点，可以适度反驳，推进讨论深入",
+            IntensityLevel.INTENSE:
+                "坚持己见！强力反驳不合理观点，据理力争！",
+            IntensityLevel.FIERCE:
+                "全力捍卫你的立场！毫不退让！激烈辩论！"
         }
         return hints.get(level, "")
     
@@ -2384,21 +2531,6 @@ class ConferenceMode(BaseMode):
         if not recent:
             return ""
         return "\n".join([f"[{m.agent_id}]: {m.content[:200]}..." if len(m.content) > 200 else f"[{m.agent_id}]: {m.content}" for m in recent])
-    
-    def _get_agent_previous_speeches(self, agent_id: str) -> str:
-        """获取某个代理之前的所有发言（用于避免重复）"""
-        messages = self.whiteboard.get_messages()
-        # 筛选该代理的消息
-        agent_messages = [m for m in messages if m.agent_id == agent_id and m.message_type == "normal"]
-        if not agent_messages:
-            return ""
-        # 最多显示最近5条发言
-        recent = agent_messages[-5:] if len(agent_messages) > 5 else agent_messages
-        lines = []
-        for i, m in enumerate(recent, 1):
-            content = m.content[:150] if len(m.content) > 150 else m.content
-            lines.append(f"第{i}次发言: {content}")
-        return "\n".join(lines)
     
     def _check_interrupt(self, content: str) -> bool:
         """检查叫停"""
@@ -2697,68 +2829,6 @@ class ConferenceMode(BaseMode):
                 pass
         
         return [{"step_id": 1, "description": proposal[:200], "expected_output": "执行结果", "suggested_tools": []}]
-    
-    async def _serial_summary_phase(self, question: str):
-        """会议模式结束后转入串行模式进行总结"""
-        print(f"\n[会议→串行] 会议讨论完成，转入串行模式进行总结...")
-        
-        # 收集会议讨论信息
-        messages = self.whiteboard.get_messages()
-        normal_msgs = [m for m in messages if m.message_type == "normal"]
-        
-        # 构建讨论文本
-        discussion_text = "\n".join([
-            f"[{m.agent_id}]: {m.content}"
-            for m in normal_msgs
-        ])
-        
-        # 提取提案（如果有）
-        proposals = []
-        if hasattr(self, '_extract_proposals'):
-            try:
-                agents = self.agent_pool.get_enabled_agents()
-                proposals = await self._extract_proposals(agents, normal_msgs)
-            except:
-                pass
-        
-        # 议程结论（如果有）
-        agenda_conclusions = []
-        if hasattr(self.whiteboard, 'get_agenda_conclusions'):
-            agenda_conclusions = self.whiteboard.get_agenda_conclusions()
-        
-        # 复盘结果（如果有）
-        review_synthesis = ""
-        if hasattr(self, '_context_review_synthesis'):
-            review_synthesis = getattr(self, '_context_review_synthesis', "")
-        elif hasattr(self, '_review_synthesis_result'):
-            review_synthesis = getattr(self, '_review_synthesis_result', "")
-        
-        print(f"  收集信息：{len(normal_msgs)} 条讨论，{len(proposals)} 个提案，议程结论：{len(agenda_conclusions)} 个")
-        
-        # 创建串行模式实例并执行
-        serial_mode = EnhancedSerialMode(
-            self.agent_pool,
-            self.whiteboard,
-            self.workspace,
-            self.tool_router,
-            self.config
-        )
-        
-        # 调用串行模式，传递会议讨论信息
-        result = await serial_mode.execute(
-            question=question,
-            proposals=proposals,
-            agenda_conclusions=agenda_conclusions,
-            discussion=discussion_text,
-            review_synthesis=review_synthesis
-        )
-        
-        # 将串行模式的结果合并到当前结果中
-        if result.success and result.final_resolution:
-            self.whiteboard.set_final_resolution(result.final_resolution)
-            print(f"\n[串行总结完成] {result.final_resolution[:150]}...")
-        else:
-            print(f"\n[串行总结失败] {result.error or '未知错误'}")
     
     async def _auto_serial_phase(self, question: str):
         """自动转入串行执行"""

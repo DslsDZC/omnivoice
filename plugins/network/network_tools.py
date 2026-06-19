@@ -56,19 +56,32 @@ class WebSearchTool(BaseTool):
         if not query:
             return ToolResult(success=False, result=None, error="搜索查询不能为空")
         
-        try:
-            if engine == "duckduckgo":
-                return await self._search_duckduckgo(query, num_results)
-            elif engine == "google":
-                return await self._search_google(query, num_results)
-            else:
-                return ToolResult(
-                    success=False,
-                    result=None,
-                    error=f"不支持的搜索引擎: {engine}"
-                )
-        except Exception as e:
-            return ToolResult(success=False, result=None, error=f"搜索错误: {str(e)}")
+        # CCB 风格：多后端降级（auto 模式：duckduckgo → bing）
+        engines_to_try = []
+        if engine == "auto":
+            engines_to_try = ["duckduckgo", "bing"]
+        elif engine == "duckduckgo":
+            engines_to_try = ["duckduckgo"]
+        elif engine == "google":
+            engines_to_try = ["google"]
+        else:
+            return ToolResult(success=False, result=None, error=f"不支持的搜索引擎: {engine}")
+
+        last_error = None
+        for eng in engines_to_try:
+            try:
+                if eng == "duckduckgo":
+                    return await self._search_duckduckgo(query, num_results)
+                elif eng == "bing":
+                    return await self._search_bing(query, num_results)
+                elif eng == "google":
+                    return await self._search_google(query, num_results)
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+        return ToolResult(success=False, result=None,
+                          error=f"所有后端失败: {last_error}")
     
     async def _search_duckduckgo(self, query: str, num_results: int) -> ToolResult:
         """使用DuckDuckGo搜索"""
@@ -123,7 +136,46 @@ class WebSearchTool(BaseTool):
             )
         except Exception as e:
             return ToolResult(success=False, result=None, error=str(e))
-    
+
+    async def _search_bing(self, query: str, num_results: int) -> ToolResult:
+        """Bing 搜索（无密钥 fallback）"""
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
+            }
+            url = "https://www.bing.com/search"
+            params = {"q": query, "count": num_results}
+            timeout = aiohttp.ClientTimeout(total=30)
+
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(url, params=params) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"Bing 返回 {resp.status}")
+                    html = await resp.text()
+
+            import re
+            results = []
+            for m in re.finditer(
+                r'<h2><a href="([^"]+)"[^>]*>(.*?)</a></h2>.*?'
+                r'<p[^>]*>(.*?)</p>',
+                html, re.DOTALL
+            ):
+                results.append({
+                    "title": re.sub(r'<[^>]+>', '', m.group(2)),
+                    "url": m.group(1),
+                    "snippet": re.sub(r'<[^>]+>', '', m.group(3)).strip(),
+                })
+                if len(results) >= num_results:
+                    break
+
+            return ToolResult(success=True, result={
+                "query": query, "results": results, "source": "Bing"
+            })
+        except Exception as e:
+            raise
+
     async def _search_google(self, query: str, num_results: int) -> ToolResult:
         """使用Google搜索（需要API Key）"""
         if not self.api_key:

@@ -665,3 +665,103 @@ class ToolSecurityMiddleware:
             )
             
             return False, None, str(e)
+
+# ── CCB 风格 Allow/Ask/Deny 三档权限 ──
+
+class Decision(Enum):
+    ALLOW = "allow"
+    ASK = "ask"
+    DENY = "deny"
+
+
+@dataclass
+class PermissionRule:
+    """权限规则：按工具名/命令/路径匹配"""
+    decision: Decision
+    tool_pattern: str = ""          # 工具名模式（支持 * 通配）
+    command_pattern: str = ""       # 命令模式（对 BashTool）
+    path_pattern: str = ""          # 路径模式（对文件工具）
+    label: str = ""                 # 规则标签（如 "安全工具"）
+    priority: int = 0               # 优先级（越大越优先）
+
+    def matches(self, tool_name: str, tool_args: dict = None) -> bool:
+        """检查是否匹配此规则"""
+        if self.tool_pattern:
+            if self.tool_pattern.endswith("*"):
+                if not tool_name.startswith(self.tool_pattern[:-1]):
+                    return False
+            elif self.tool_pattern != tool_name:
+                return False
+        if self.command_pattern and tool_args:
+            cmd = tool_args.get("command", "") or ""
+            if self.command_pattern not in cmd:
+                return False
+        if self.path_pattern and tool_args:
+            path = tool_args.get("path", "") or str(tool_args.get("args", ""))
+            if self.path_pattern not in path:
+                return False
+        return True
+
+
+class PermissionManager:
+    """权限管理器：规则匹配 + 优先级裁决 + ASK 回调"""
+
+    def __init__(self):
+        self._rules: List[PermissionRule] = []
+        self._ask_callback = None  # async (tool_name, args) -> bool
+
+    def set_ask_callback(self, cb):
+        self._ask_callback = cb
+
+    def add_rule(self, rule: PermissionRule):
+        self._rules.append(rule)
+        self._rules.sort(key=lambda r: r.priority, reverse=True)
+
+    def add_default_rules(self):
+        """添加默认规则集"""
+        self._rules = [
+            PermissionRule(Decision.ALLOW, "calculator"),
+            PermissionRule(Decision.ALLOW, "current_time"),
+            PermissionRule(Decision.ALLOW, "temp_file_read"),
+            PermissionRule(Decision.ALLOW, "temp_list_files"),
+            PermissionRule(Decision.ALLOW, "temp_file_search"),
+            PermissionRule(Decision.ASK,  "temp_file_write", priority=1),
+            PermissionRule(Decision.ASK,  "temp_file_delete", priority=1),
+            PermissionRule(Decision.ASK,  "code_execute", priority=2),
+            PermissionRule(Decision.ASK,  "web_search", priority=1),
+            PermissionRule(Decision.ASK,  "web_fetch", priority=1),
+            PermissionRule(Decision.DENY, "http_request", priority=10,
+                           label="高风险"),
+        ]
+        self._rules.sort(key=lambda r: r.priority, reverse=True)
+
+    def decide(self, tool_name: str, agent_id: str = "",
+               tool_args: dict = None) -> tuple:
+        """裁决：返回 (Decision, 理由)"""
+        for rule in self._rules:
+            if rule.matches(tool_name, tool_args):
+                return rule.decision, rule.label
+        # 默认：不在白名单的 ASK
+        return Decision.ASK, "未配置规则"
+
+    async def check(self, tool_name: str, agent_id: str = "",
+                    tool_args: dict = None) -> tuple:
+        """完整检查：规则裁决 + ASK 回调"""
+        decision, label = self.decide(tool_name, agent_id, tool_args)
+        if decision == Decision.ASK and self._ask_callback:
+            allowed = await self._ask_callback(tool_name, agent_id, tool_args)
+            if allowed:
+                return Decision.ALLOW, "用户允许"
+            return Decision.DENY, "用户拒绝"
+        return decision, label
+
+
+# 全局单例
+_perm_mgr: Optional[PermissionManager] = None
+
+def get_perm_manager() -> PermissionManager:
+    global _perm_mgr
+    if _perm_mgr is None:
+        _perm_mgr = PermissionManager()
+        _perm_mgr.add_default_rules()
+    return _perm_mgr

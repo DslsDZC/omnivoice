@@ -77,6 +77,13 @@ class ExceptionHandler:
         self._deadlock_range = (0.45, 0.55)
         self._deadlock_rounds = 2
         
+        # CCB 风格：限流重试状态
+        self._retry_counts: Dict[str, int] = {}     # agent_id -> retry_count
+        self._retry_backoff: Dict[str, float] = {}  # agent_id -> backoff_seconds
+        self._max_retries = 3
+        self._backoff_base = 1.0  # 初始退避 1s
+        self._backoff_multiplier = 2.0
+
         # 恢复回调
         self._recovery_callbacks: Dict[ExceptionType, Callable] = {}
         
@@ -363,3 +370,31 @@ class ExceptionHandler:
                 }
                 for agent_id, r in self._agent_records.items()
             }
+
+    # ── CCB 风格自愈机制 ──
+
+    def should_retry(self, agent_id: str) -> tuple:
+        """检查是否应该重试，返回 (是否重试, 等待秒数)"""
+        count = self._retry_counts.get(agent_id, 0)
+        if count >= self._max_retries:
+            return False, 0
+        backoff = self._backoff_base * (self._backoff_multiplier ** count)
+        self._retry_counts[agent_id] = count + 1
+        self._retry_backoff[agent_id] = backoff
+        return True, backoff
+
+    def retry_success(self, agent_id: str):
+        """重试成功后重置计数"""
+        self._retry_counts.pop(agent_id, None)
+        self._retry_backoff.pop(agent_id, None)
+
+    def should_background_tool(self, tool_name: str, elapsed: float) -> bool:
+        """工具执行超时后是否后台化"""
+        return elapsed > 30.0
+
+    def get_retry_info(self) -> dict:
+        """获取重试状态"""
+        return {
+            "retries": dict(self._retry_counts),
+            "backoffs": {k: f"{v:.1f}s" for k, v in self._retry_backoff.items()},
+        }

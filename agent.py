@@ -258,87 +258,165 @@ class Agent:
         
         return payload
     
-    async def call_api(self, messages: List[Dict], 
+    async def call_api(self, messages: List[Dict],
                        tools: Optional[List[Dict]] = None,
                        tool_choice: str = "auto",
                        temperature: Optional[float] = None,
-                       max_tokens: Optional[int] = None) -> AgentResponse:
-        """调用 API（自动适配推理模型）"""
+                       max_tokens: Optional[int] = None,
+                       stream: bool = False,
+                       on_token: Optional[Callable] = None) -> AgentResponse:
+        """调用 API（支持 streaming，不支持则退回非 streaming）"""
         self._is_busy = True
         self._last_activity = time.time()
-        
+
+        if not stream:
+            return await self._call_api_blocking(
+                messages, tools, tool_choice, temperature, max_tokens
+            )
+
+        try:
+            return await self._call_api_streaming(
+                messages, tools, tool_choice, temperature, max_tokens, on_token
+            )
+        except Exception as e:
+            print(f"  [streaming] {self.id} streaming 失败，退回非 streaming: {e}")
+            return await self._call_api_blocking(
+                messages, tools, tool_choice, temperature, max_tokens
+            )
+
+
+    async def _call_api_blocking(self, messages, tools, tool_choice, temperature, max_tokens):
+        """非 streaming 模式"""
+        self._is_busy = True
         try:
             headers = {
                 "Authorization": f"Bearer {self.api.api_key}",
                 "Content-Type": "application/json"
             }
-            
-            # 构建请求载荷
             payload = self._build_payload(
-                messages=messages,
-                tools=tools,
-                tool_choice=tool_choice,
-                temperature=temperature,
-                max_tokens=max_tokens
+                messages=messages, tools=tools, tool_choice=tool_choice,
+                temperature=temperature, max_tokens=max_tokens
             )
-            
-            # 推理模型需要更长的超时时间
             timeout_seconds = 300 if self._is_reasoning_model else 120
             timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-            
-            # 使用 certifi 的 SSL 证书
             ssl_context = ssl.create_default_context(cafile=certifi.where())
             connector = aiohttp.TCPConnector(ssl=ssl_context)
-            
+
             async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
                 url = f"{self.api.base_url.rstrip('/')}/chat/completions"
                 async with session.post(url, headers=headers, json=payload) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
                         return AgentResponse(
-                            agent_id=self.id,
-                            content="",
-                            success=False,
+                            agent_id=self.id, content="", success=False,
                             error=f"API错误 {resp.status}: {error_text[:500]}"
                         )
-                    
                     data = await resp.json()
-            
-            # 解析响应
             return self._parse_response(data)
-            
+
         except asyncio.TimeoutError:
-            return AgentResponse(
-                agent_id=self.id,
-                content="",
-                success=False,
-                error=f"API调用超时（{'推理模型可能需要更长时间' if self._is_reasoning_model else ''}）"
-            )
+            return AgentResponse(agent_id=self.id, content="", success=False,
+                error="API调用超时")
         except aiohttp.ClientError as e:
-            return AgentResponse(
-                agent_id=self.id,
-                content="",
-                success=False,
-                error=f"网络错误: {str(e)}"
-            )
+            return AgentResponse(agent_id=self.id, content="", success=False,
+                error=f"网络错误: {str(e)}")
         except json.JSONDecodeError as e:
-            return AgentResponse(
-                agent_id=self.id,
-                content="",
-                success=False,
-                error=f"响应解析错误: {str(e)}"
-            )
+            return AgentResponse(agent_id=self.id, content="", success=False,
+                error=f"响应解析错误: {str(e)}")
         except Exception as e:
-            return AgentResponse(
-                agent_id=self.id,
-                content="",
-                success=False,
-                error=f"API调用异常: {str(e)}"
-            )
+            return AgentResponse(agent_id=self.id, content="", success=False,
+                error=f"API调用异常: {str(e)}")
         finally:
             self._is_busy = False
             self._last_activity = time.time()
-    
+    async def _call_api_streaming(self, messages, tools, tool_choice,
+                                   temperature, max_tokens, on_token=None):
+        """SSE streaming 模式，不支持则抛异常触发退回"""
+        import json as json_mod
+
+        headers = {
+            "Authorization": f"Bearer {self.api.api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = self._build_payload(
+            messages=messages, tools=tools, tool_choice=tool_choice,
+            temperature=temperature, max_tokens=max_tokens
+        )
+        payload["stream"] = True
+
+        timeout = aiohttp.ClientTimeout(total=300)
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+
+        content = ""
+        tool_calls = []
+        current_tool = None
+        current_tool_input = ""
+
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            url = f"{self.api.base_url.rstrip('/')}/chat/completions"
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    raise RuntimeError(f"streaming {resp.status}: {error_text[:200]}")
+
+                async for line in resp.content:
+                    if not line or line == b"\n":
+                        continue
+                    text = line.decode("utf-8", errors="replace").strip()
+                    if not text or text == "data: [DONE]":
+                        continue
+                    if text.startswith("data: "):
+                        text = text[6:]
+                    try:
+                        chunk = json_mod.loads(text)
+                    except json_mod.JSONDecodeError:
+                        continue
+
+                    choices = chunk.get("choices") or []
+                    for c in choices:
+                        delta = c.get("delta", {}) or {}
+                        finish = c.get("finish_reason")
+
+                        # 文本块
+                        if "content" in delta and delta["content"]:
+                            token = delta["content"]
+                            content += token
+                            if on_token:
+                                try:
+                                    on_token(token)
+                                except Exception:
+                                    pass
+
+                        # 工具调用（流式 JSON）
+                        if "tool_calls" in delta:
+                            for tc in delta["tool_calls"]:
+                                if tc.get("id"):
+                                    current_tool = {"id": tc["id"], "name": "", "arguments": ""}
+                                func = tc.get("function", {})
+                                if current_tool:
+                                    if func.get("name"):
+                                        current_tool["name"] = func["name"]
+                                    if func.get("arguments"):
+                                        current_tool_input += func["arguments"]
+
+                                if finish == "tool_calls" and current_tool:
+                                    try:
+                                        args = json_mod.loads(current_tool_input) if current_tool_input else {}
+                                    except json_mod.JSONDecodeError:
+                                        args = {}
+                                    current_tool["arguments"] = args
+                                    tool_calls.append(current_tool)
+                                    current_tool = None
+                                    current_tool_input = ""
+
+        return AgentResponse(
+            agent_id=self.id,
+            content=content,
+            tool_calls=tool_calls,
+            success=True,
+            usage={},
+        )
     def _parse_response(self, data: Dict) -> AgentResponse:
         """解析 API 响应，处理不同模型的响应格式"""
         choice = data.get("choices", [{}])[0]

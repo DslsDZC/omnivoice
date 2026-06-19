@@ -347,28 +347,44 @@ class PluginManager:
             self._tool_keywords[name] = [k.lower() for k in keywords if len(k) > 1]
     
     def search_tools_by_keyword(self, keyword: str, limit: int = 5) -> List[Dict]:
-        """按关键词搜索工具"""
+        """CCB 风格：关键词加权评分搜索工具"""
         keyword = keyword.lower()
         results = []
-        
+
         for name, keywords in self._tool_keywords.items():
-            # 计算匹配度
+            name_lower = name.lower()
+            tool = self._tools.get(name)
+            desc = (tool.description if tool and tool.description else "").lower()
             score = 0
-            for kw in keywords:
-                if keyword in kw:
-                    score += 1
-                    if kw == keyword:
-                        score += 2  # 精确匹配加分
-            
+
+            # 精确匹配工具名：10分
+            if name_lower == keyword:
+                score += 10
+            # 工具名包含关键词：7分
+            elif keyword in name_lower:
+                score += 7
+            # 关键词前缀匹配：4分
+            elif any(name_lower.startswith(kw) for kw in keyword.split() if len(kw) > 1):
+                score += 4
+
+            # 描述包含关键词：3分
+            if keyword in desc:
+                score += 3
+            # 描述包含部分词：1分
+            else:
+                for kw in keyword.split():
+                    if len(kw) > 1 and kw in desc:
+                        score += 1
+                    if len(kw) > 1 and kw in name_lower:
+                        score += 1
+
             if score > 0:
-                tool = self._tools.get(name)
                 results.append({
                     "name": name,
                     "description": tool.description if tool else "",
                     "score": score
                 })
-        
-        # 按分数排序
+
         results.sort(key=lambda x: x["score"], reverse=True)
         return results[:limit]
     
@@ -529,12 +545,13 @@ class PluginManager:
 class ToolRouter:
     """工具路由器"""
     
-    def __init__(self, plugin_manager: PluginManager, workspace_manager=None, 
+    def __init__(self, plugin_manager: PluginManager, workspace_manager=None,
                  agent_pool=None, api_call_func=None):
         self.plugin_manager = plugin_manager
         self.workspace_manager = workspace_manager
         self.agent_pool = agent_pool
         self.api_call_func = api_call_func  # 模型调用函数
+        self.project_dir: str = ""  # 工作目录（代理可读的项目路径）
     
     def set_api_call_func(self, func: Callable):
         """设置模型调用函数"""
@@ -621,6 +638,9 @@ class ToolRouter:
         # 添加工作区路径
         if self.workspace_manager:
             context["workspace_path"] = self.workspace_manager.get_session_path()
+        # 添加项目目录（可读的工作目录，用于分析外部项目）
+        if self.project_dir:
+            context["project_dir"] = self.project_dir
         
         result = await self.plugin_manager.execute(tool_name, args, context)
         

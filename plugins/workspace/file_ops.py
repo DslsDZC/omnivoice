@@ -406,9 +406,116 @@ class TempListFilesTool(BaseTool):
             return ToolResult(success=False, result=None, error=f"列出文件错误: {str(e)}")
 
 
-class FileOpsPlugin(BasePlugin):
-    """文件操作插件"""
-    
+
+
+class TempFileSearchTool(BaseTool):
+    """搜索工作区文件 — Glob（按文件名） + Grep（按内容）"""
+    name = "temp_file_search"
+    description = "搜索工作区文件，支持按文件名(glob)或按内容(grep)搜索，限制返回200条"
+    security_level = "medium"
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "搜索模式：glob模式（如 *.py）或 grep 文本"
+            },
+            "keyword": {
+                "type": "string",
+                "description": "关键词搜索（与pattern等价，仅用作文件内容查找）"
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["glob", "grep"],
+                "description": "glob=按文件名匹配，grep=按文件内容搜索"
+            },
+            "path": {
+                "type": "string",
+                "description": "搜索路径（相对于工作区，默认为根）"
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "最大返回条数（默认100，不超过200）"
+            },
+            "ext": {
+                "type": "string",
+                "description": "grep模式的文件扩展名过滤，如 .py,.js"
+            }
+        },
+        "required": []
+    }
+
+    async def execute(self, args: Dict[str, Any], context: Dict) -> ToolResult:
+        base = context.get("project_dir") or context.get("workspace_path")
+        if not base:
+            return ToolResult(success=False, result=None, error="没有可用工作目录")
+
+        pattern = args.get("pattern", "") or args.get("keyword", "") or args.get("keywords", "") or ""
+        if isinstance(pattern, list):
+            pattern = " ".join(pattern)
+        pattern = pattern.strip()
+        mode = args.get("mode", "glob")
+        rel_path = args.get("path", "").strip() or "."
+        max_results = min(args.get("max_results", 100), 200)
+        ext_filter = args.get("ext", "")
+
+        full_path = os.path.join(base, rel_path) if rel_path != "." else base
+        if not os.path.isdir(full_path):
+            return ToolResult(success=False, result=None, error=f"路径不是目录: {rel_path}")
+
+        results = []
+
+        if mode == "glob":
+            # Glob：按文件名模式匹配
+            import fnmatch
+            for root, dirs, files in os.walk(full_path):
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                for f in files:
+                    if f.startswith('.'):
+                        continue
+                    if fnmatch.fnmatch(f, pattern):
+                        rel = os.path.relpath(os.path.join(root, f), full_path)
+                        results.append(rel)
+                        if len(results) >= max_results:
+                            break
+                if len(results) >= max_results:
+                    break
+
+        elif mode == "grep":
+            # Grep：按文件内容搜索
+            exts = [e.strip() for e in ext_filter.split(",") if e.strip()] if ext_filter else []
+
+            for root, dirs, files in os.walk(full_path):
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__pycache__']
+                for f in files:
+                    if f.startswith('.') or f in ('__pycache__',):
+                        continue
+                    if exts:
+                        if not any(f.endswith(e) for e in exts):
+                            continue
+                    fpath = os.path.join(root, f)
+                    try:
+                        with open(fpath, 'r', encoding='utf-8', errors='replace') as fp:
+                            for i, line in enumerate(fp, 1):
+                                if pattern in line:
+                                    rel = os.path.relpath(fpath, full_path)
+                                    results.append(f"{rel}:{i}: {line.rstrip()[:200]}")
+                                    if len(results) >= max_results:
+                                        break
+                            if len(results) >= max_results:
+                                break
+                    except (OSError, UnicodeDecodeError):
+                        continue
+                if len(results) >= max_results:
+                    break
+
+        if not results:
+            return ToolResult(success=True, result="无匹配结果")
+
+        lines = "\n".join(results)
+        summary = f"找到 {len(results)} 个匹配"
+        return ToolResult(success=True, result=f"{summary}:\n{lines}")
+
     plugin_name = "file_ops"
     plugin_version = "1.1.0"
     plugin_description = "工作区文件操作工具（带安全沙箱）"
@@ -425,3 +532,16 @@ class FileOpsPlugin(BasePlugin):
         self.register_tool(TempFileWriteTool())
         self.register_tool(TempFileDeleteTool())
         self.register_tool(TempListFilesTool())
+        self.register_tool(TempFileSearchTool())
+class FileOpsPlugin(BasePlugin):
+    """文件操作插件"""
+    plugin_name = "file_ops"
+    plugin_version = "1.1.0"
+    plugin_description = "工作区文件操作插件（带安全沙箱）"
+
+    def initialize(self, config: dict = None):
+        self.register_tool(TempFileReadTool())
+        self.register_tool(TempFileWriteTool())
+        self.register_tool(TempFileDeleteTool())
+        self.register_tool(TempListFilesTool())
+        self.register_tool(TempFileSearchTool())

@@ -134,7 +134,7 @@ class SerialConfig:
     """串行模式配置"""
     step_timeout_sec: int = 60
     max_retries: int = 2
-    enable_snapshot: bool = True  # 是否启用快照功能
+    max_agents: int = 2  # 串行模式使用的代理数（1个提案+其余投票）
     trigger_meeting_keywords: List[str] = field(default_factory=lambda: [
         "不确定", "有分歧", "需要讨论", "无法确定", "建议",
         "多种方案", "争议", "需要帮助", "[REQUEST_MEETING]",
@@ -475,133 +475,68 @@ DEFAULT_PROMPTS = {
 
 只输出JSON。""",
 
-            "conference_discussion": """你是会议参与者，具备专家级分析能力。
+    "conference_discussion": """你是会议参与者，具备专家级分析能力。
 
-        
+身份：{identity}
+性格：{personality}
+主题：{topic}
 
-        身份：{identity}
+=== 已有讨论 ===
+{discussion_history}
 
-        性格：{personality}
+=== 高级分析框架 ===
 
-        主题：{topic}
+【第一阶段：苏格拉底式提问】
+在发言前，先问自己三个问题：
+1. 这个方案的核心假设是什么？假设是否合理？
+2. 如果这个方案是错的，最可能的原因是什么？
+3. 有什么反例或边界情况被忽略了？
 
-        
+【第二阶段：辩证分析】
+正题：现有方案的优点是什么？
+反题：现有方案的问题/漏洞是什么？（必须找出至少一个）
+合题：如何改进或综合？
 
-        === 已有讨论 ===
+【第三阶段：多维验证】
+根据问题类型，选择合适的验证维度：
+- 数值类：计算验证、单位换算、边界检查
+- 方案类：可行性、完整性、约束满足度
+- 创意类：创新性、实用性、可实现性
+- 决策类：利弊权衡、风险评估、替代方案
 
-        {discussion_history}
+【第四阶段：专业视角】
+自动识别问题领域，从专业角度审视：
+- 识别问题所属领域（如：规划/设计/分析/评估等）
+- 应用该领域的专业标准和方法论
+- 指出非专业人士容易忽略的问题
 
-        
+=== 输出格式（严格按此格式，缺一不可）===
+[立场：支持/反对/质疑/补充/修正]
+【给人看】一句人类能懂的自然口语，像真人聊天说话（必须输出！这是给用户看的）
+【核心观点】一句话概括你的贡献
+【分析过程】一句话说明问题识别和验证结果
+【建议】一句话改进方案（如有）
 
-        === 高级分析框架 ===
+⚠️ 警告：【给人看】是必填项！必须用口语化的方式说一句人话！
 
-        
+=== 质量红线 ===
+⛔ 禁止空话："我支持"、"我同意"必须附带具体理由
+⛔ 禁止复制：不能复制粘贴已有内容
+⛔ 禁止跳过验证：涉及数据/事实必须验证
+⛔ 禁止过早结束：方案不完善时不能用[END]
 
-        【第一阶段：苏格拉底式提问】
+=== 叫停机制 ===
+[INTERRUPT] 全体叫停提议：你的提案
+[INTERRUPT:@{agent_id}] 指定叫停：针对某代理
+[AGENDA_END] 议程结束请求
 
-        在发言前，先问自己三个问题：
+=== [END]触发条件 ===
+✓ 方案具体到可直接执行
+✓ 所有约束条件已验证满足
+✓ 至少有1次质疑和回应
+✓ 关键信息已核实正确
 
-        1. 这个方案的核心假设是什么？假设是否合理？
-
-        2. 如果这个方案是错的，最可能的原因是什么？
-
-        3. 有什么反例或边界情况被忽略了？
-
-        
-
-        【第二阶段：辩证分析】
-
-        正题：现有方案的优点是什么？
-
-        反题：现有方案的问题/漏洞是什么？（必须找出至少一个）
-
-        合题：如何改进或综合？
-
-        
-
-        【第三阶段：多维验证】
-
-        根据问题类型，选择合适的验证维度：
-
-        - 数值类：计算验证、单位换算、边界检查
-
-        - 方案类：可行性、完整性、约束满足度
-
-        - 创意类：创新性、实用性、可实现性
-
-        - 决策类：利弊权衡、风险评估、替代方案
-
-        
-
-        【第四阶段：专业视角】
-
-        自动识别问题领域，从专业角度审视：
-
-        - 识别问题所属领域（如：规划/设计/分析/评估等）
-
-        - 应用该领域的专业标准和方法论
-
-        - 指出非专业人士容易忽略的问题
-
-        
-
-        === 输出格式（严格按此格式，缺一不可）===
-
-        [立场：支持/反对/质疑/补充/修正]
-
-        【给人看】一句人类能懂的自然口语，像真人聊天说话（必须输出！这是给用户看的）
-
-        【核心观点】一句话概括你的贡献
-
-        【分析过程】一句话说明问题识别和验证结果
-
-        【建议】一句话改进方案（如有）
-
-        
-
-        ⚠️ 警告：【给人看】是必填项！必须用口语化的方式说一句人话！
-
-        
-
-        === 质量红线 ===
-
-        ⛔ 禁止空话："我支持"、"我同意"必须附带具体理由
-
-        ⛔ 禁止复制：不能复制粘贴已有内容
-
-        ⛔ 禁止跳过验证：涉及数据/事实必须验证
-
-        ⛔ 禁止过早结束：方案不完善时不能用[END]
-
-        ⛔ 禁止重复：绝对不可与之前任何发言内容重复！若检查发现无新观点可补充，立即输出[AGENDA_END]同意结束议题
-
-        ⛔ 禁止消极否定：不要一味说"无法实现"，要思考"如果要实现，需要什么条件"
-
-        
-
-        === 叫停机制 ===
-
-        [INTERRUPT] 全体叫停提议：你的提案
-
-        [INTERRUPT:@{agent_id}] 指定叫停：针对某代理
-
-        [AGENDA_END] 议程结束请求
-
-        
-
-        === [END]触发条件 ===
-
-        ✓ 方案具体到可直接执行
-
-        ✓ 所有约束条件已验证满足
-
-        ✓ 至少有1次质疑和回应
-
-        ✓ 关键信息已核实正确
-
-        
-
-        请发表你的观点：""",
+请发表你的观点：""",
 
     "conference_voting": """表决阶段。
 
@@ -776,26 +711,6 @@ DEFAULT_PROMPTS = {
 问题：{issue}
 
 请各位代理讨论并给出建议。""",
-
-    "serial_conclusion": """【串行模式 - 最终总结】
-
-原始问题：{question}
-
-会议讨论要点：
-{discussion}
-
-复盘结果：
-{review_synthesis}
-
-已有提议：
-{proposals}
-
-请生成最终总结报告，要求：
-1. 总结核心结论（50-100字）
-2. 列出关键观点（3-5条）
-3. 指出后续行动方向（如适用）
-
-直接输出总结报告：""",
 
     "end_check_prompt": """判断讨论是否应该结束。
 
@@ -1147,70 +1062,13 @@ DEFAULT_PROMPTS = {
 
 输出格式：数字排序，如 "2,1,3,4" 表示方案2最重要，其次方案1...""",
 
-    "review_debate": """【复盘讨论阶段】
+    "review_debate": """议题：{question}
 
-议题：{question}
-
-会议产出的方案/观点：
+方案排序结果：
 {proposals_text}
 
-你的性格：{personality}
-你的立场：{stance}
-
-请参与复盘讨论，目标是**细化方案**：
-1. 对各方案进行评价：哪个最可行？哪个有风险？
-2. 指出方案的细节不足之处，提出具体改进建议
-3. 如果有多个方案，讨论如何整合或选择
-4. 提出执行时需要注意的事项
-
-输出格式：
-【评价】对方案的整体看法
-【细化建议】具体的改进或整合建议
-【注意事项】执行时需要关注的点
-
-请发表你的观点（100-200字）：""",
-
-    "review_round": """【复盘第{round}轮】
-
-议题：{question}
-
-已有方案：
-{proposals_text}
-
-已有讨论：
-{previous_discussion}
-
-你的性格：{personality}
-
-请继续细化方案：
-1. 回应其他代理的观点
-2. 提出新的细节或修正
-3. 尝试形成共识
-
-输出格式：
-【回应】对其他观点的回应
-【补充】你的新建议
-【共识倾向】是否接近共识
-
-请发言（80-150字）：""",
-
-    "review_synthesize": """【复盘综合】
-
-议题：{question}
-
-各方讨论：
-{discussion}
-
-方案列表：
-{proposals_text}
-
-请综合各方意见，输出：
-1. 最终确定的方案方向（一个或多个）
-2. 每个方案的关键细节
-3. 需要进一步执行的事项
-
-输出JSON：
-{{"directions": ["方向1", "方向2"], "details": "具体细节", "next_actions": ["行动1", "行动2"]}}""",
+你是否同意这个排序结果？是否需要进一步讨论？
+输出：同意 或 需要讨论（并说明原因）""",
 
     "final_conclusion": """请生成最终结论。
 
@@ -1264,7 +1122,6 @@ class PromptsConfig:
     serial_feedback: str = DEFAULT_PROMPTS["serial_feedback"]
     serial_revise: str = DEFAULT_PROMPTS["serial_revise"]
     serial_temp_meeting: str = DEFAULT_PROMPTS["serial_temp_meeting"]
-    serial_conclusion: str = DEFAULT_PROMPTS["serial_conclusion"]
     end_check_prompt: str = DEFAULT_PROMPTS["end_check_prompt"]
     agenda_generation: str = DEFAULT_PROMPTS["agenda_generation"]
     agenda_debate: str = DEFAULT_PROMPTS["agenda_debate"]
@@ -1304,8 +1161,6 @@ class PromptsConfig:
     extract_proposals: str = DEFAULT_PROMPTS["extract_proposals"]
     proposal_ranking: str = DEFAULT_PROMPTS["proposal_ranking"]
     review_debate: str = DEFAULT_PROMPTS["review_debate"]
-    review_round: str = DEFAULT_PROMPTS["review_round"]
-    review_synthesize: str = DEFAULT_PROMPTS["review_synthesize"]
     final_conclusion: str = DEFAULT_PROMPTS["final_conclusion"]
     interrupt_vote: str = DEFAULT_PROMPTS["interrupt_vote"]
 
@@ -1326,9 +1181,21 @@ class IntensityConfig:
 
 
 @dataclass
+class DiversityConfig:
+    """观点多样性配置（DALC / DReaMAD 风格）"""
+    enabled: bool = True
+    min_stance_distance: float = 0.5        # 最小立场距离（低于此值重新生成）
+    adversarial_intensity: float = 0.7      # 初始对抗强度 0-1（EVINCE 风格）
+    embedding_check: bool = False           # 是否做 embedding 相似度检查（需依赖）
+    use_cfmad_preset: bool = True           # 使用 CFMAD 式强行分配对立立场
+
+
+@dataclass
 class GlobalConfig:
     """全局配置"""
     enable_network_tools: bool = False
+    user_savings: int = 5                   # 用户节省偏好 1-10
+    project_dir: str = ""                   # 工作目录（让代理分析的项目路径）
     language: LanguageConfig = field(default_factory=LanguageConfig)
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     voting: VotingConfig = field(default_factory=VotingConfig)
@@ -1342,6 +1209,7 @@ class GlobalConfig:
     oscillation: OscillationConfig = field(default_factory=OscillationConfig)
     intensity: IntensityConfig = field(default_factory=IntensityConfig)
     behaviors: BehaviorConfig = field(default_factory=BehaviorConfig)
+    diversity: DiversityConfig = field(default_factory=DiversityConfig)
     prompts: PromptsConfig = field(default_factory=PromptsConfig)
 
 
@@ -1607,6 +1475,7 @@ def load_config(config_path: str) -> SystemConfig:
     serial_config = SerialConfig(
         step_timeout_sec=serial_data.get('step_timeout_sec', 60),
         max_retries=serial_data.get('max_retries', 2),
+        max_agents=serial_data.get('max_agents', 2),
         trigger_meeting_keywords=serial_data.get('trigger_meeting_keywords', [
             "不确定", "有分歧", "需要讨论", "无法确定", "建议",
             "多种方案", "争议", "需要帮助", "[REQUEST_MEETING]",
@@ -1677,7 +1546,6 @@ def load_config(config_path: str) -> SystemConfig:
         serial_feedback=prompts_data.get('serial_feedback', DEFAULT_PROMPTS["serial_feedback"]),
         serial_revise=prompts_data.get('serial_revise', DEFAULT_PROMPTS["serial_revise"]),
         serial_temp_meeting=prompts_data.get('serial_temp_meeting', DEFAULT_PROMPTS["serial_temp_meeting"]),
-        serial_conclusion=prompts_data.get('serial_conclusion', DEFAULT_PROMPTS["serial_conclusion"]),
         end_check_prompt=prompts_data.get('end_check_prompt', DEFAULT_PROMPTS["end_check_prompt"]),
         agenda_generation=prompts_data.get('agenda_generation', DEFAULT_PROMPTS["agenda_generation"]),
         agenda_debate=prompts_data.get('agenda_debate', DEFAULT_PROMPTS["agenda_debate"]),
@@ -1717,8 +1585,6 @@ def load_config(config_path: str) -> SystemConfig:
         extract_proposals=prompts_data.get('extract_proposals', DEFAULT_PROMPTS["extract_proposals"]),
         proposal_ranking=prompts_data.get('proposal_ranking', DEFAULT_PROMPTS["proposal_ranking"]),
         review_debate=prompts_data.get('review_debate', DEFAULT_PROMPTS["review_debate"]),
-        review_round=prompts_data.get('review_round', DEFAULT_PROMPTS["review_round"]),
-        review_synthesize=prompts_data.get('review_synthesize', DEFAULT_PROMPTS["review_synthesize"]),
         final_conclusion=prompts_data.get('final_conclusion', DEFAULT_PROMPTS["final_conclusion"]),
         interrupt_vote=prompts_data.get('interrupt_vote', DEFAULT_PROMPTS["interrupt_vote"])
     )
@@ -1815,8 +1681,19 @@ def load_config(config_path: str) -> SystemConfig:
         smoothing_factor=intensity_data.get('smoothing_factor', 0.3)
     )
     
+    # 观点多样性配置（DALC / DReaMAD / EVINCE）
+    diversity_data = global_data.get('diversity', {})
+    diversity_config = DiversityConfig(
+        enabled=diversity_data.get('enabled', True),
+        min_stance_distance=diversity_data.get('min_stance_distance', 0.5),
+        adversarial_intensity=diversity_data.get('adversarial_intensity', 0.7),
+        embedding_check=diversity_data.get('embedding_check', False),
+        use_cfmad_preset=diversity_data.get('use_cfmad_preset', True)
+    )
+
     global_config = GlobalConfig(
         enable_network_tools=global_data.get('enable_network_tools', False),
+        user_savings=int(global_data.get('user_savings', 5)),
         workspace=workspace_config,
         voting=voting_config,
         conference=conference_config,
@@ -1829,6 +1706,7 @@ def load_config(config_path: str) -> SystemConfig:
         oscillation=oscillation_config,
         intensity=intensity_config,
         behaviors=behaviors_config,
+        diversity=diversity_config,
         language=language_config,
         prompts=prompts_config
     )

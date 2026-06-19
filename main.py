@@ -205,9 +205,10 @@ class Omnivoice:
             for path, error in errors.items():
                 print(f"  [警告] 插件加载失败 {path}: {error}")
     
-    async def run_session(self, question: str, 
+    async def run_session(self, question: str,
                           mode_preference: Optional[str] = None,
-                          project_id: Optional[str] = None) -> dict:
+                          project_id: Optional[str] = None,
+                          tui=None) -> dict:
         """运行一个会话"""
         # 创建新会话
         session_id = self.workspace.create_session()
@@ -222,47 +223,50 @@ class Omnivoice:
             user_id=self.user_id,
             project_id=project_id
         )
+        _out = tui.log if tui else print
+
         if memories:
             memory_dicts = [m.to_dict() for m in memories]
             self.whiteboard.inject_long_term_memories(memory_dicts)
-            print(f"[记忆] 已加载 {len(memories)} 条长期记忆")
-        
-        # 更新工具路由器的工作区引用
+            _out(f"[记忆] 已加载 {len(memories)} 条长期记忆")
+
+        # 更新工具路由器的工作区引用（保留 project_dir）
+        old_project = getattr(self.tool_router, 'project_dir', '')
         self.tool_router = ToolRouter(self.plugin_manager, self.workspace)
+        if old_project:
+            self.tool_router.project_dir = old_project
         self.agent_pool.set_tool_router(self.tool_router)
-        
-        print(f"[会话] ID: {session_id}")
-        print(f"[工作区] {self.workspace.session_path}")
-        print()
-        
+
+        _out(f"[会话] ID: {session_id}")
+        _out(f"[工作区] {self.workspace.session_path}")
+
         start_time = time.time()
-        
+
         try:
             # 模式决策
             selected_mode = mode_preference
-            
+
             if not selected_mode:
-                print("[决策] 正在进行模式投票...")
+                _out("[决策] 正在进行模式投票...")
                 decision = await self.decision_maker.vote(
                     self.agent_pool.get_enabled_agents(),
                     question,
                     self.whiteboard
                 )
                 from mode_decision import format_voting_result
-                print(format_voting_result(decision))
-                print()
+                _out(format_voting_result(decision))
                 selected_mode = decision.selected_mode
             
             self.whiteboard.set_current_mode(selected_mode)
             
             # 执行对应模式
-            result = await self._execute_mode(selected_mode, question)
+            result = await self._execute_mode(selected_mode, question, tui=tui)
             
             # 输出结果
             self._print_result(selected_mode, result)
             
             elapsed = time.time() - start_time
-            print(f"\n[耗时] {elapsed:.2f}秒")
+            _out(f"\n[耗时] {elapsed:.2f}秒")
             
             return {
                 "success": result.success,
@@ -277,27 +281,31 @@ class Omnivoice:
             import traceback
             traceback.print_exc()
             print(f"\n[错误] 执行错误: {str(e)}")
+            if tui:
+                tui.error(str(e))
             return {
                 "success": False,
                 "error": str(e),
                 "session_id": session_id
             }
     
-    async def _execute_mode(self, mode: str, question: str):
+    async def _execute_mode(self, mode: str, question: str, tui=None):
         """执行指定模式"""
         from modes import ConferenceMode, SerialMode
-        
+
         if mode == "conference":
             mode_instance = ConferenceMode(
                 self.agent_pool, self.whiteboard,
                 self.workspace, self.tool_router, self.config.global_config
             )
+            if tui:
+                mode_instance.set_tui(tui)
         else:  # serial
             mode_instance = SerialMode(
                 self.agent_pool, self.whiteboard,
                 self.workspace, self.tool_router, self.config.global_config
             )
-        
+
         return await mode_instance.execute(question)
     
     def _print_result(self, mode: str, result):
@@ -328,38 +336,56 @@ class CLI:
         self.running = False
         self._history: List[str] = []
         self._cmd_history: List[str] = []
-    
+        self._ctrl_c_count = 0  # Ctrl+C 计数器：一次清空，两次退出
+
     def start(self):
         """启动CLI"""
+        # 清空聊天日志
+        try:
+            from omnivoice_display import LOG_FILE
+            LOG_FILE.write("", encoding="utf-8")
+        except Exception:
+            pass
+
         print("\n=== Omnivoice ===\n")
-        
+        print("  提示: 在另一个终端运行以下命令可查看聊天界面:")
+        print(f"         python omnivoice_chat.py\n")
+
         # 初始化系统
         self.system.initialize()
-        
-        # 设置信号处理
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
-        
+
+        # 信号处理（SIGTERM 直接退出，SIGINT 用计数器实现"一次清空两次退出"）
+        signal.signal(signal.SIGTERM, lambda s, f: setattr(self, 'running', False))
+        # SIGINT 让 Python 默认触发 KeyboardInterrupt，我们在 except 里处理
+
         self.running = True
-        
+
         # 主循环
         while self.running:
             try:
                 # 使用简单输入（兼容性更好）
                 line = input("-> ").strip()
-                
+
+                # 正常输入时重置中断计数
+                self._ctrl_c_count = 0
+
                 if not line:
                     continue
-                
+
                 # 保存历史
                 self._history.append(line)
-                
+
                 # 处理输入
                 self._process_input(line)
-                
+
             except KeyboardInterrupt:
-                print()
-                continue
+                self._ctrl_c_count += 1
+                if self._ctrl_c_count >= 2:
+                    print("\n[退出]")
+                    break
+                else:
+                    print("\n（再按一次 Ctrl+C 退出）")
+                    continue
             except EOFError:
                 break
         
@@ -596,13 +622,12 @@ Omnivoice - 多代理协作系统
             return
         print(f"已设置 {parts[0]} = {parts[1]}")
     
-    async def _run_question(self, question: str):
+    async def _run_question(self, question: str, quiet: bool = True):
         """运行问题"""
-        print()
-        await self.system.run_session(question)
-    
-    def _handle_signal(self, signum, frame):
-        self.running = False
+        from omnivoice_display import OmnivoiceDisplay
+
+        display = OmnivoiceDisplay(quiet=quiet)
+        await self.system.run_session(question, tui=display)
     
     def _cleanup_and_exit(self):
         self.system.cleanup()
@@ -620,19 +645,38 @@ def main():
     """主函数"""
     config_path = "config.yaml"
     
-    if len(sys.argv) > 1:
-        arg = sys.argv[1]
+    project_dir = ""
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
         if arg.endswith('.yaml') or arg.endswith('.yml'):
             config_path = arg
+            i += 1
+        elif arg == '--project' and i + 1 < len(sys.argv):
+            project_dir = os.path.abspath(sys.argv[i + 1])
+            i += 2
         elif arg in ['-h', '--help']:
-            print("用法: python main.py [配置文件]")
-            print("\n命令:")
+            print("用法: python main.py [选项]")
+            print("\n选项:")
+            print("  --project <目录>     设置工作目录（让代理分析的项目路径）")
             print("  --conference <问题>  会议模式")
             print("  --serial <问题>      串行模式")
+            print("  -i \"<问题>\"          单次测试模式")
             print("  tools                列出工具")
             print("  agents               列出代理")
             print("  quit                 退出")
             return
+        elif arg == '-i' and i + 1 < len(sys.argv):
+            # 单次测试模式：运行一个问题后退出
+            question = sys.argv[i + 1]
+            cli = CLI(config_path)
+            cli.system.initialize()
+            if project_dir:
+                cli.system.tool_router.project_dir = project_dir
+            asyncio.run(cli._run_question(question, quiet=False))
+            return
+        else:
+            i += 1
     
     if not os.path.exists(config_path):
         print(f"[错误] 配置文件不存在: {config_path}")
